@@ -1,7 +1,7 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * Drive access function calls
- * Copyright © 2011-2020 Pete Batard <pete@akeo.ie>
+ * Copyright © 2011-2021 Pete Batard <pete@akeo.ie>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -22,6 +22,7 @@
 #endif
 
 #include <windows.h>
+#include <windowsx.h>
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
@@ -34,6 +35,7 @@
 #include "rufus.h"
 #include "missing.h"
 #include "resource.h"
+#include "settings.h"
 #include "msapi_utf8.h"
 #include "localization.h"
 
@@ -70,8 +72,9 @@ PF_TYPE_DECL(NTAPI, NTSTATUS, NtQueryVolumeInformationFile, (HANDLE, PIO_STATUS_
  * Globals
  */
 RUFUS_DRIVE_INFO SelectedDrive;
-BOOL installed_uefi_ntfs;
-uint64_t partition_offset[3];
+extern BOOL installed_uefi_ntfs, write_as_esp;
+extern int nWindowsVersion, nWindowsBuildNumber;
+uint64_t partition_offset[PI_MAX];
 uint64_t persistence_size = 0;
 
 /*
@@ -90,9 +93,8 @@ BOOL SetAutoMount(BOOL enable)
 	DWORD size;
 	BOOL ret = FALSE;
 
-	hMountMgr = CreateFileA(MOUNTMGR_DOS_DEVICE_NAME, GENERIC_READ|GENERIC_WRITE,
-		FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-	if (hMountMgr == NULL)
+	hMountMgr = CreateFileA(MOUNTMGR_DOS_DEVICE_NAME, 0, FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (hMountMgr == INVALID_HANDLE_VALUE)
 		return FALSE;
 	ret = DeviceIoControl(hMountMgr, IOCTL_MOUNTMGR_SET_AUTO_MOUNT, &enable, sizeof(enable), NULL, 0, &size, NULL);
 	CloseHandle(hMountMgr);
@@ -107,9 +109,8 @@ BOOL GetAutoMount(BOOL* enabled)
 
 	if (enabled == NULL)
 		return FALSE;
-	hMountMgr = CreateFileA(MOUNTMGR_DOS_DEVICE_NAME, GENERIC_READ|GENERIC_WRITE,
-		FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-	if (hMountMgr == NULL)
+	hMountMgr = CreateFileA(MOUNTMGR_DOS_DEVICE_NAME, 0, FILE_SHARE_READ|FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (hMountMgr == INVALID_HANDLE_VALUE)
 		return FALSE;
 	ret = DeviceIoControl(hMountMgr, IOCTL_MOUNTMGR_QUERY_AUTO_MOUNT, NULL, 0, enabled, sizeof(*enabled), &size, NULL);
 	CloseHandle(hMountMgr);
@@ -164,7 +165,8 @@ static HANDLE GetHandle(char* Path, BOOL bLockDrive, BOOL bWriteAccess, BOOL bWr
 		if ((GetLastError() != ERROR_SHARING_VIOLATION) && (GetLastError() != ERROR_ACCESS_DENIED))
 			break;
 		if (i == 0) {
-			uprintf("Waiting for access on %s [%s]...", Path, DevPath);
+			uprintf("Notice: Volume Device Path is %s", DevPath);
+			uprintf("Waiting for access on %s...", Path);
 		} else if (!bWriteShare && (i > DRIVE_ACCESS_RETRIES/3)) {
 			// If we can't seem to get a hold of the drive for some time, try to enable FILE_SHARE_WRITE...
 			uprintf("Warning: Could not obtain exclusive rights. Retrying with write sharing enabled...");
@@ -403,11 +405,7 @@ char* AltGetLogicalName(DWORD DriveIndex, uint64_t PartitionOffset, BOOL bKeepTr
 	static_strcpy(volume_name, groot_name);
 	if (!QueryDosDeviceA(path, &volume_name[groot_len], (DWORD)(MAX_PATH - groot_len)) || (strlen(volume_name) < 20)) {
 		suprintf("Could not find a DOS volume name for '%s': %s", path, WindowsErrorString());
-		// If we are on the right drive, we enable a custom access mode through physical + offset
-		if (!matching_drive)
-			goto out;
-		static_sprintf(volume_name, "\\\\.\\PhysicalDrive%lu%s %I64u %I64u", DriveIndex, bKeepTrailingBackslash ? "\\" : "",
-			SelectedDrive.PartitionOffset[i], SelectedDrive.PartitionSize[i]);
+		goto out;
 	} else if (bKeepTrailingBackslash) {
 		static_strcat(volume_name, "\\");
 	}
@@ -418,22 +416,49 @@ out:
 }
 
 /*
+ * Custom volume name for extfs formatting (that includes partition offset and partition size)
+ * so that these can be created and accessed on pre 1703 versions of Windows.
+ */
+char* GetExtPartitionName(DWORD DriveIndex, uint64_t PartitionOffset)
+{
+	DWORD i;
+	char* ret = NULL, volume_name[MAX_PATH];
+
+	// Can't operate if we're not on the selected drive
+	if (DriveIndex != SelectedDrive.DeviceNumber)
+		goto out;
+	CheckDriveIndex(DriveIndex);
+	for (i = 0; (i < MAX_PARTITIONS) && (PartitionOffset != SelectedDrive.PartitionOffset[i]); i++);
+	if (i >= MAX_PARTITIONS)
+		goto out;
+	static_sprintf(volume_name, "\\\\.\\PhysicalDrive%lu %I64u %I64u", DriveIndex,
+		SelectedDrive.PartitionOffset[i], SelectedDrive.PartitionSize[i]);
+	ret = safe_strdup(volume_name);
+out:
+	return ret;
+}
+
+static const char* VdsErrorString(HRESULT hr) {
+	SetLastError(hr);
+	return WindowsErrorString();
+}
+
+/*
  * Call on VDS to refresh the drive layout
  */
 BOOL RefreshLayout(DWORD DriveIndex)
 {
-	BOOL r = FALSE;
-	HRESULT hr;
+	HRESULT hr = S_FALSE;
 	wchar_t wPhysicalName[24];
-	IVdsServiceLoader *pLoader;
-	IVdsService *pService;
+	IVdsServiceLoader* pLoader = NULL;
+	IVdsService* pService = NULL;
 	IEnumVdsObject *pEnum;
 
 	CheckDriveIndex(DriveIndex);
 	wnsprintf(wPhysicalName, ARRAYSIZE(wPhysicalName), L"\\\\?\\PhysicalDrive%lu", DriveIndex);
 
 	// Initialize COM
-	IGNORE_RETVAL(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED));
+	IGNORE_RETVAL(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
 	IGNORE_RETVAL(CoInitializeSecurity(NULL, -1, NULL, NULL, RPC_C_AUTHN_LEVEL_CONNECT,
 		RPC_C_IMP_LEVEL_IMPERSONATE, NULL, 0, NULL));
 
@@ -441,94 +466,91 @@ BOOL RefreshLayout(DWORD DriveIndex)
 	hr = CoCreateInstance(&CLSID_VdsLoader, NULL, CLSCTX_LOCAL_SERVER | CLSCTX_REMOTE_SERVER,
 		&IID_IVdsServiceLoader, (void **)&pLoader);
 	if (hr != S_OK) {
-		VDS_SET_ERROR(hr);
-		uprintf("Could not create VDS Loader Instance: %s", WindowsErrorString());
+		uprintf("Could not create VDS Loader Instance: %s", VdsErrorString(hr));
 		goto out;
 	}
 
 	// Load the VDS Service
 	hr = IVdsServiceLoader_LoadService(pLoader, L"", &pService);
-	IVdsServiceLoader_Release(pLoader);
 	if (hr != S_OK) {
-		VDS_SET_ERROR(hr);
-		uprintf("Could not load VDS Service: %s", WindowsErrorString());
+		uprintf("Could not load VDS Service: %s", VdsErrorString(hr));
 		goto out;
 	}
 
 	// Wait for the Service to become ready if needed
 	hr = IVdsService_WaitForServiceReady(pService);
 	if (hr != S_OK) {
-		VDS_SET_ERROR(hr);
-		uprintf("VDS Service is not ready: %s", WindowsErrorString());
+		uprintf("VDS Service is not ready: %s", VdsErrorString(hr));
 		goto out;
 	}
 
 	// Query the VDS Service Providers
 	hr = IVdsService_QueryProviders(pService, VDS_QUERY_SOFTWARE_PROVIDERS, &pEnum);
 	if (hr != S_OK) {
-		VDS_SET_ERROR(hr);
-		uprintf("Could not query VDS Service Providers: %s", WindowsErrorString());
+		uprintf("Could not query VDS Service Providers: %s", VdsErrorString(hr));
 		goto out;
 	}
 
 	// Remove mountpoints
 	hr = IVdsService_CleanupObsoleteMountPoints(pService);
 	if (hr != S_OK) {
-		VDS_SET_ERROR(hr);
-		uprintf("Could not clean up VDS mountpoints: %s", WindowsErrorString());
+		uprintf("Could not clean up VDS mountpoints: %s", VdsErrorString(hr));
 		goto out;
 	}
 
 	// Invoke layout refresh
 	hr = IVdsService_Refresh(pService);
 	if (hr != S_OK) {
-		VDS_SET_ERROR(hr);
-		uprintf("Could not refresh VDS layout: %s", WindowsErrorString());
+		uprintf("Could not refresh VDS layout: %s", VdsErrorString(hr));
 		goto out;
 	}
 
 	// Force re-enum
 	hr = IVdsService_Reenumerate(pService);
 	if (hr != S_OK) {
-		VDS_SET_ERROR(hr);
-		uprintf("Could not refresh VDS layout: %s", WindowsErrorString());
+		uprintf("Could not refresh VDS layout: %s", VdsErrorString(hr));
 		goto out;
 	}
-	r = TRUE;
 
-	out:
-		return r;
+out:
+	if (pService != NULL)
+		IVdsService_Release(pService);
+	if (pLoader != NULL)
+		IVdsServiceLoader_Release(pLoader);
+	CoUninitialize();
+	VDS_SET_ERROR(hr);
+	return (hr == S_OK);
 }
 
 /*
- * Delete all the partitions from a disk, using VDS
- * Mostly copied from https://social.msdn.microsoft.com/Forums/vstudio/en-US/b90482ae-4e44-4b08-8731-81915030b32a/createpartition-using-vds-interface-throw-error-enointerface-dcom?forum=vcgeneral
+ * Generic call to instantiate a VDS Disk Interface. Mostly copied from:
+ * https://social.msdn.microsoft.com/Forums/vstudio/en-US/b90482ae-4e44-4b08-8731-81915030b32a/createpartition-using-vds-interface-throw-error-enointerface-dcom?forum=vcgeneral
+ * See also: https://docs.microsoft.com/en-us/windows/win32/vds/working-with-enumeration-objects
  */
-BOOL DeletePartitions(DWORD DriveIndex)
+static BOOL GetVdsDiskInterface(DWORD DriveIndex, const IID* InterfaceIID, void** pInterfaceInstance, BOOL bSilent)
 {
-	BOOL r = FALSE;
-	HRESULT hr;
+	HRESULT hr = S_FALSE;
 	ULONG ulFetched;
 	wchar_t wPhysicalName[24];
-	IVdsServiceLoader *pLoader;
-	IVdsService *pService;
-	IEnumVdsObject *pEnum;
-	IUnknown *pUnk;
+	IVdsServiceLoader* pLoader;
+	IVdsService* pService;
+	IEnumVdsObject* pEnum;
+	IUnknown* pUnk;
 
+	*pInterfaceInstance = NULL;
 	CheckDriveIndex(DriveIndex);
 	wnsprintf(wPhysicalName, ARRAYSIZE(wPhysicalName), L"\\\\?\\PhysicalDrive%lu", DriveIndex);
 
 	// Initialize COM
-	IGNORE_RETVAL(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED));
+	IGNORE_RETVAL(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
 	IGNORE_RETVAL(CoInitializeSecurity(NULL, -1, NULL, NULL, RPC_C_AUTHN_LEVEL_CONNECT,
 		RPC_C_IMP_LEVEL_IMPERSONATE, NULL, 0, NULL));
 
 	// Create a VDS Loader Instance
 	hr = CoCreateInstance(&CLSID_VdsLoader, NULL, CLSCTX_LOCAL_SERVER | CLSCTX_REMOTE_SERVER,
-		&IID_IVdsServiceLoader, (void **)&pLoader);
+		&IID_IVdsServiceLoader, (void**)&pLoader);
 	if (hr != S_OK) {
-		VDS_SET_ERROR(hr);
-		uprintf("Could not create VDS Loader Instance: %s", WindowsErrorString());
+		suprintf("Could not create VDS Loader Instance: %s", VdsErrorString(hr));
 		goto out;
 	}
 
@@ -536,179 +558,400 @@ BOOL DeletePartitions(DWORD DriveIndex)
 	hr = IVdsServiceLoader_LoadService(pLoader, L"", &pService);
 	IVdsServiceLoader_Release(pLoader);
 	if (hr != S_OK) {
-		VDS_SET_ERROR(hr);
-		uprintf("Could not load VDS Service: %s", WindowsErrorString());
+		suprintf("Could not load VDS Service: %s", VdsErrorString(hr));
 		goto out;
 	}
 
 	// Wait for the Service to become ready if needed
 	hr = IVdsService_WaitForServiceReady(pService);
 	if (hr != S_OK) {
-		VDS_SET_ERROR(hr);
-		uprintf("VDS Service is not ready: %s", WindowsErrorString());
+		suprintf("VDS Service is not ready: %s", VdsErrorString(hr));
 		goto out;
 	}
 
 	// Query the VDS Service Providers
 	hr = IVdsService_QueryProviders(pService, VDS_QUERY_SOFTWARE_PROVIDERS, &pEnum);
+	IVdsService_Release(pService);
 	if (hr != S_OK) {
-		VDS_SET_ERROR(hr);
-		uprintf("Could not query VDS Service Providers: %s", WindowsErrorString());
+		suprintf("Could not query VDS Service Providers: %s", VdsErrorString(hr));
 		goto out;
 	}
 
 	while (IEnumVdsObject_Next(pEnum, 1, &pUnk, &ulFetched) == S_OK) {
-		IVdsProvider *pProvider;
-		IVdsSwProvider *pSwProvider;
-		IEnumVdsObject *pEnumPack;
-		IUnknown *pPackUnk;
+		IVdsProvider* pProvider;
+		IVdsSwProvider* pSwProvider;
+		IEnumVdsObject* pEnumPack;
+		IUnknown* pPackUnk;
 
 		// Get VDS Provider
-		hr = IUnknown_QueryInterface(pUnk, &IID_IVdsProvider, (void **)&pProvider);
+		hr = IUnknown_QueryInterface(pUnk, &IID_IVdsProvider, (void**)&pProvider);
 		IUnknown_Release(pUnk);
 		if (hr != S_OK) {
-			VDS_SET_ERROR(hr);
-			uprintf("Could not get VDS Provider: %s", WindowsErrorString());
-			goto out;
+			suprintf("Could not get VDS Provider: %s", VdsErrorString(hr));
+			break;
 		}
 
 		// Get VDS Software Provider
-		hr = IVdsSwProvider_QueryInterface(pProvider, &IID_IVdsSwProvider, (void **)&pSwProvider);
+		hr = IVdsSwProvider_QueryInterface(pProvider, &IID_IVdsSwProvider, (void**)&pSwProvider);
 		IVdsProvider_Release(pProvider);
 		if (hr != S_OK) {
-			VDS_SET_ERROR(hr);
-			uprintf("Could not get VDS Software Provider: %s", WindowsErrorString());
-			goto out;
+			suprintf("Could not get VDS Software Provider: %s", VdsErrorString(hr));
+			break;
 		}
 
 		// Get VDS Software Provider Packs
 		hr = IVdsSwProvider_QueryPacks(pSwProvider, &pEnumPack);
 		IVdsSwProvider_Release(pSwProvider);
 		if (hr != S_OK) {
-			VDS_SET_ERROR(hr);
-			uprintf("Could not get VDS Software Provider Packs: %s", WindowsErrorString());
-			goto out;
+			suprintf("Could not get VDS Software Provider Packs: %s", VdsErrorString(hr));
+			break;
 		}
 
 		// Enumerate Provider Packs
 		while (IEnumVdsObject_Next(pEnumPack, 1, &pPackUnk, &ulFetched) == S_OK) {
-			IVdsPack *pPack;
-			IEnumVdsObject *pEnumDisk;
-			IUnknown *pDiskUnk;
+			IVdsPack* pPack;
+			IEnumVdsObject* pEnumDisk;
+			IUnknown* pDiskUnk;
 
-			hr = IUnknown_QueryInterface(pPackUnk, &IID_IVdsPack, (void **)&pPack);
+			hr = IUnknown_QueryInterface(pPackUnk, &IID_IVdsPack, (void**)&pPack);
 			IUnknown_Release(pPackUnk);
 			if (hr != S_OK) {
-				VDS_SET_ERROR(hr);
-				uprintf("Could not query VDS Software Provider Pack: %s", WindowsErrorString());
-				goto out;
+				suprintf("Could not query VDS Software Provider Pack: %s", VdsErrorString(hr));
+				break;
 			}
 
 			// Use the pack interface to access the disks
 			hr = IVdsPack_QueryDisks(pPack, &pEnumDisk);
+			IVdsPack_Release(pPack);
 			if (hr != S_OK) {
-				VDS_SET_ERROR(hr);
-				uprintf("Could not query VDS disks: %s", WindowsErrorString());
-				goto out;
+				suprintf("Could not query VDS disks: %s", VdsErrorString(hr));
+				break;
 			}
 
 			// List disks
 			while (IEnumVdsObject_Next(pEnumDisk, 1, &pDiskUnk, &ulFetched) == S_OK) {
-				VDS_DISK_PROP diskprop;
-				VDS_PARTITION_PROP* prop_array;
-				LONG i, prop_array_size;
-				IVdsDisk *pDisk;
-				IVdsAdvancedDisk *pAdvancedDisk;
+				VDS_DISK_PROP prop;
+				IVdsDisk* pDisk;
 
 				// Get the disk interface.
-				hr = IUnknown_QueryInterface(pDiskUnk, &IID_IVdsDisk, (void **)&pDisk);
+				hr = IUnknown_QueryInterface(pDiskUnk, &IID_IVdsDisk, (void**)&pDisk);
+				IUnknown_Release(pDiskUnk);
 				if (hr != S_OK) {
-					VDS_SET_ERROR(hr);
-					uprintf("Could not query VDS Disk Interface: %s", WindowsErrorString());
-					goto out;
+					suprintf("Could not query VDS Disk Interface: %s", VdsErrorString(hr));
+					break;
 				}
 
 				// Get the disk properties
-				hr = IVdsDisk_GetProperties(pDisk, &diskprop);
-				if (hr != S_OK) {
-					VDS_SET_ERROR(hr);
-					uprintf("Could not query VDS Disk Properties: %s", WindowsErrorString());
-					goto out;
+				hr = IVdsDisk_GetProperties(pDisk, &prop);
+				if ((hr != S_OK) && (hr != VDS_S_PROPERTIES_INCOMPLETE)) {
+					IVdsDisk_Release(pDisk);
+					suprintf("Could not query VDS Disk Properties: %s", VdsErrorString(hr));
+					break;
 				}
 
-				// Isolate the disk we want
-				if (_wcsicmp(wPhysicalName, diskprop.pwszName) != 0) {
-					IVdsDisk_Release(pDisk);
+				// Check if we are on the target disk
+				// uprintf("GetVdsDiskInterface: Seeking %S found %S", wPhysicalName, prop.pwszName);
+				hr = (HRESULT)_wcsicmp(wPhysicalName, prop.pwszName);
+				CoTaskMemFree(prop.pwszName);
+				if (hr != S_OK) {
+					hr = S_OK;
 					continue;
 				}
 
-				// Instantiate the AdvanceDisk interface for our disk.
-				hr = IVdsDisk_QueryInterface(pDisk, &IID_IVdsAdvancedDisk, (void **)&pAdvancedDisk);
+				// Instantiate the requested VDS disk interface
+				hr = IVdsDisk_QueryInterface(pDisk, InterfaceIID, pInterfaceInstance);
 				IVdsDisk_Release(pDisk);
-				if (hr != S_OK) {
-					VDS_SET_ERROR(hr);
-					uprintf("Could not access VDS Advanced Disk interface: %s", WindowsErrorString());
-					goto out;
-				}
+				if (hr != S_OK)
+					suprintf("Could not access the requested Disk interface: %s", VdsErrorString(hr));
 
-				// Query the partition data, so we can get the start offset, which we need for deletion
-				hr = IVdsAdvancedDisk_QueryPartitions(pAdvancedDisk, &prop_array, &prop_array_size);
-				if (hr == S_OK) {
-					uprintf("Deleting ALL partition(s) from disk '%S':", diskprop.pwszName);
-					// Now go through each partition
-					for (i = 0; i < prop_array_size; i++) {
-						uprintf("● Partition %d (offset: %lld, size: %s)", prop_array[i].ulPartitionNumber,
-							prop_array[i].ullOffset, SizeToHumanReadable(prop_array[i].ullSize, FALSE, FALSE));
-						hr = IVdsAdvancedDisk_DeletePartition(pAdvancedDisk, prop_array[i].ullOffset, TRUE, TRUE);
-						if (hr != S_OK) {
-							r = FALSE;
-							VDS_SET_ERROR(hr);
-							uprintf("Could not delete partitions: %s", WindowsErrorString());
-						}
-					}
-					r = TRUE;
-				} else {
-					uprintf("No partition to delete on disk '%S'", diskprop.pwszName);
-					r = TRUE;
-				}
-				CoTaskMemFree(prop_array);
-
-#if 0
-				// Issue a Clean while we're at it
-				HRESULT hr2 = E_FAIL;
-				ULONG completed;
-				IVdsAsync* pAsync;
-				hr = IVdsAdvancedDisk_Clean(pAdvancedDisk, TRUE, FALSE, FALSE, &pAsync);
-				while (SUCCEEDED(hr)) {
-					if (IS_ERROR(FormatStatus)) {
-						IVdsAsync_Cancel(pAsync);
-						break;
-					}
-					hr = IVdsAsync_QueryStatus(pAsync, &hr2, &completed);
-					if (SUCCEEDED(hr)) {
-						hr = hr2;
-						if (hr == S_OK)
-							break;
-						if (hr == VDS_E_OPERATION_PENDING)
-							hr = S_OK;
-					}
-					Sleep(500);
-				}
-				if (hr != S_OK) {
-					VDS_SET_ERROR(hr);
-					uprintf("Could not clean disk: %s", WindowsErrorString());
-				}
-#endif
-				IVdsAdvancedDisk_Release(pAdvancedDisk);
-				goto out;
+				// With the interface found, we should be able to return
+				break;
 			}
+			IEnumVdsObject_Release(pEnumDisk);
+		}
+		IEnumVdsObject_Release(pEnumPack);
+	}
+	IEnumVdsObject_Release(pEnum);
+
+out:
+	CoUninitialize();
+	VDS_SET_ERROR(hr);
+	return (hr == S_OK);
+}
+
+/*
+ * Invoke IVdsService::Refresh() and/or IVdsService::Reenumerate() to force a
+ * rescan of the VDS disks. This can become necessary after writing an image
+ * such as Ubuntu 20.10, as Windows may "lose" the active disk otherwise...
+ */
+BOOL VdsRescan(DWORD dwRescanType, DWORD dwSleepTime, BOOL bSilent)
+{
+	BOOL ret = TRUE;
+	HRESULT hr = S_FALSE;
+	IVdsServiceLoader* pLoader;
+	IVdsService* pService;
+
+	IGNORE_RETVAL(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
+	IGNORE_RETVAL(CoInitializeSecurity(NULL, -1, NULL, NULL, RPC_C_AUTHN_LEVEL_CONNECT,
+		RPC_C_IMP_LEVEL_IMPERSONATE, NULL, 0, NULL));
+
+	hr = CoCreateInstance(&CLSID_VdsLoader, NULL, CLSCTX_LOCAL_SERVER | CLSCTX_REMOTE_SERVER,
+		&IID_IVdsServiceLoader, (void**)&pLoader);
+	if (hr != S_OK) {
+		suprintf("Could not create VDS Loader Instance: %s", VdsErrorString(hr));
+		return FALSE;
+	}
+
+	hr = IVdsServiceLoader_LoadService(pLoader, L"", &pService);
+	IVdsServiceLoader_Release(pLoader);
+	if (hr != S_OK) {
+		suprintf("Could not load VDS Service: %s", VdsErrorString(hr));
+		return FALSE;
+	}
+
+	hr = IVdsService_WaitForServiceReady(pService);
+	if (hr != S_OK) {
+		suprintf("VDS Service is not ready: %s", VdsErrorString(hr));
+		return FALSE;
+	}
+
+	// https://docs.microsoft.com/en-us/windows/win32/api/vds/nf-vds-ivdsservice-refresh
+	// This method synchronizes the disk layout to the layout known to the disk driver.
+	// It does not force the driver to read the layout from the disk.
+	// Additionally, this method refreshes the view of all objects in the VDS cache.
+	if (dwRescanType & VDS_RESCAN_REFRESH) {
+		hr = IVdsService_Refresh(pService);
+		if (hr != S_OK) {
+			suprintf("VDS Refresh failed: %s", VdsErrorString(hr));
+			ret = FALSE;
 		}
 	}
 
-out:
-	return r;
+	// https://docs.microsoft.com/en-us/windows/win32/api/vds/nf-vds-ivdsservice-reenumerate
+	// This method returns immediately after a bus rescan request is issued.
+	// The operation might be incomplete when the method returns.
+	if (dwRescanType & VDS_RESCAN_REENUMERATE) {
+		hr = IVdsService_Reenumerate(pService);
+		if (hr != S_OK) {
+			suprintf("VDS Re-enumeration failed: %s", VdsErrorString(hr));
+			ret = FALSE;
+		}
+	}
+
+	if (dwSleepTime != 0)
+		Sleep(dwSleepTime);
+
+	CoUninitialize();
+	return ret;
 }
 
+/*
+ * Delete one partition at offset PartitionOffset, or all partitions if the offset is 0.
+ */
+BOOL DeletePartition(DWORD DriveIndex, ULONGLONG PartitionOffset, BOOL bSilent)
+{
+	HRESULT hr = S_FALSE;
+	VDS_PARTITION_PROP* prop_array;
+	LONG i, prop_array_size;
+	IVdsAdvancedDisk *pAdvancedDisk;
+
+	if (!GetVdsDiskInterface(DriveIndex, &IID_IVdsAdvancedDisk, (void**)&pAdvancedDisk, bSilent))
+		return FALSE;
+	if (pAdvancedDisk == NULL) {
+		suprintf("Looks like Windows has \"lost\" our disk - Forcing a VDS rescan...");
+		VdsRescan(VDS_RESCAN_REFRESH | VDS_RESCAN_REENUMERATE, 1000, bSilent);
+		if (!GetVdsDiskInterface(DriveIndex, &IID_IVdsAdvancedDisk, (void**)&pAdvancedDisk, bSilent) ||
+			(pAdvancedDisk == NULL)) {
+			suprintf("Could not locate disk - Aborting.");
+			return FALSE;
+		}
+	}
+
+	// Query the partition data, so we can get the start offset, which we need for deletion
+	hr = IVdsAdvancedDisk_QueryPartitions(pAdvancedDisk, &prop_array, &prop_array_size);
+	if (hr == S_OK) {
+		suprintf("Deleting partition%s:", (PartitionOffset == 0) ? "s" : "");
+		// Now go through each partition
+		for (i = 0; i < prop_array_size; i++) {
+			if ((PartitionOffset != 0) && (prop_array[i].ullOffset != PartitionOffset))
+				continue;
+			suprintf("● Partition %d (offset: %lld, size: %s)", prop_array[i].ulPartitionNumber,
+				prop_array[i].ullOffset, SizeToHumanReadable(prop_array[i].ullSize, FALSE, FALSE));
+			hr = IVdsAdvancedDisk_DeletePartition(pAdvancedDisk, prop_array[i].ullOffset, TRUE, TRUE);
+			if (hr != S_OK)
+				suprintf("Could not delete partition: %s", VdsErrorString(hr));
+		}
+	} else {
+		suprintf("No partition to delete on disk");
+		hr = S_OK;
+	}
+	CoTaskMemFree(prop_array);
+	IVdsAdvancedDisk_Release(pAdvancedDisk);
+	VDS_SET_ERROR(hr);
+	return (hr == S_OK);
+}
+
+/*
+ * Count on Microsoft for *COMPLETELY CRIPPLING* an API when alledgedly upgrading it...
+ * As illustrated when you do so with diskpart (which uses VDS behind the scenes), VDS
+ * simply *DOES NOT* list all the volumes that the system can see, especially compared
+ * to what mountvol (which uses FindFirstVolume()/FindNextVolume()) and other APIs do.
+ * Also for reference, if you want to list volumes through WMI in PowerShell:
+ * Get-WmiObject win32_volume | Format-Table -Property DeviceID,Name,Label,Capacity
+ */
+BOOL ListVdsVolumes(BOOL bSilent)
+{
+	HRESULT hr = S_FALSE;
+	ULONG ulFetched;
+	IVdsServiceLoader* pLoader;
+	IVdsService* pService;
+	IEnumVdsObject* pEnum;
+	IUnknown* pUnk;
+
+	// Initialize COM
+	IGNORE_RETVAL(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
+	IGNORE_RETVAL(CoInitializeSecurity(NULL, -1, NULL, NULL, RPC_C_AUTHN_LEVEL_CONNECT,
+		RPC_C_IMP_LEVEL_IMPERSONATE, NULL, 0, NULL));
+
+	// Create a VDS Loader Instance
+	hr = CoCreateInstance(&CLSID_VdsLoader, NULL, CLSCTX_LOCAL_SERVER | CLSCTX_REMOTE_SERVER,
+		&IID_IVdsServiceLoader, (void**)&pLoader);
+	if (hr != S_OK) {
+		suprintf("Could not create VDS Loader Instance: %s", VdsErrorString(hr));
+		goto out;
+	}
+
+	// Load the VDS Service
+	hr = IVdsServiceLoader_LoadService(pLoader, L"", &pService);
+	IVdsServiceLoader_Release(pLoader);
+	if (hr != S_OK) {
+		suprintf("Could not load VDS Service: %s", VdsErrorString(hr));
+		goto out;
+	}
+
+	// Wait for the Service to become ready if needed
+	hr = IVdsService_WaitForServiceReady(pService);
+	if (hr != S_OK) {
+		suprintf("VDS Service is not ready: %s", VdsErrorString(hr));
+		goto out;
+	}
+
+	// Query the VDS Service Providers
+	hr = IVdsService_QueryProviders(pService, VDS_QUERY_SOFTWARE_PROVIDERS, &pEnum);
+	IVdsService_Release(pService);
+	if (hr != S_OK) {
+		suprintf("Could not query VDS Service Providers: %s", VdsErrorString(hr));
+		goto out;
+	}
+
+	while (IEnumVdsObject_Next(pEnum, 1, &pUnk, &ulFetched) == S_OK) {
+		IVdsProvider* pProvider;
+		IVdsSwProvider* pSwProvider;
+		IEnumVdsObject* pEnumPack;
+		IUnknown* pPackUnk;
+
+		// Get VDS Provider
+		hr = IUnknown_QueryInterface(pUnk, &IID_IVdsProvider, (void**)&pProvider);
+		IUnknown_Release(pUnk);
+		if (hr != S_OK) {
+			suprintf("Could not get VDS Provider: %s", VdsErrorString(hr));
+			break;
+		}
+
+		// Get VDS Software Provider
+		hr = IVdsSwProvider_QueryInterface(pProvider, &IID_IVdsSwProvider, (void**)&pSwProvider);
+		IVdsProvider_Release(pProvider);
+		if (hr != S_OK) {
+			suprintf("Could not get VDS Software Provider: %s", VdsErrorString(hr));
+			break;
+		}
+
+		// Get VDS Software Provider Packs
+		hr = IVdsSwProvider_QueryPacks(pSwProvider, &pEnumPack);
+		IVdsSwProvider_Release(pSwProvider);
+		if (hr != S_OK) {
+			suprintf("Could not get VDS Software Provider Packs: %s", VdsErrorString(hr));
+			break;
+		}
+
+		// Enumerate Provider Packs
+		while (IEnumVdsObject_Next(pEnumPack, 1, &pPackUnk, &ulFetched) == S_OK) {
+			IVdsPack* pPack;
+			IEnumVdsObject* pEnumVolume;
+			IUnknown* pVolumeUnk;
+
+			hr = IUnknown_QueryInterface(pPackUnk, &IID_IVdsPack, (void**)&pPack);
+			IUnknown_Release(pPackUnk);
+			if (hr != S_OK) {
+				suprintf("Could not query VDS Software Provider Pack: %s", VdsErrorString(hr));
+				break;
+			}
+
+			// Use the pack interface to access the disks
+			hr = IVdsPack_QueryVolumes(pPack, &pEnumVolume);
+			if (hr != S_OK) {
+				suprintf("Could not query VDS volumes: %s", VdsErrorString(hr));
+				break;
+			}
+
+			// List volumes
+			while (IEnumVdsObject_Next(pEnumVolume, 1, &pVolumeUnk, &ulFetched) == S_OK) {
+				IVdsVolume* pVolume;
+				IVdsVolumeMF3* pVolumeMF3;
+				VDS_VOLUME_PROP prop;
+				LPWSTR* wszPathArray;
+				ULONG i, ulNumberOfPaths;
+
+				// Get the volume interface.
+				hr = IUnknown_QueryInterface(pVolumeUnk, &IID_IVdsVolume, (void**)&pVolume);
+				if (hr != S_OK) {
+					suprintf("Could not query VDS Volume Interface: %s", VdsErrorString(hr));
+					break;
+				}
+
+				// Get the volume properties
+				hr = IVdsVolume_GetProperties(pVolume, &prop);
+				if ((hr != S_OK) && (hr != VDS_S_PROPERTIES_INCOMPLETE)) {
+					suprintf("Could not query VDS Volume Properties: %s", VdsErrorString(hr));
+					break;
+				}
+
+				uprintf("FOUND VOLUME: '%S'", prop.pwszName);
+				CoTaskMemFree(prop.pwszName);
+				IVdsVolume_Release(pVolume);
+
+				// Get the volume MF3 interface.
+				hr = IUnknown_QueryInterface(pVolumeUnk, &IID_IVdsVolumeMF3, (void**)&pVolumeMF3);
+				if (hr != S_OK) {
+					suprintf("Could not query VDS VolumeMF3 Interface: %s", VdsErrorString(hr));
+					break;
+				}
+
+				// Get the volume properties
+				hr = IVdsVolumeMF3_QueryVolumeGuidPathnames(pVolumeMF3, &wszPathArray, &ulNumberOfPaths);
+				if ((hr != S_OK) && (hr != VDS_S_PROPERTIES_INCOMPLETE)) {
+					suprintf("Could not query VDS VolumeMF3 GUID PathNames: %s", VdsErrorString(hr));
+					break;
+				}
+				hr = S_OK;
+
+				for (i = 0; i < ulNumberOfPaths; i++)
+					uprintf("  VOL GUID: '%S'", wszPathArray[i]);
+				CoTaskMemFree(wszPathArray);
+				IVdsVolume_Release(pVolumeMF3);
+				IUnknown_Release(pVolumeUnk);
+			}
+			IEnumVdsObject_Release(pEnumVolume);
+		}
+		IEnumVdsObject_Release(pEnumPack);
+	}
+	IEnumVdsObject_Release(pEnum);
+
+out:
+	CoUninitialize();
+	VDS_SET_ERROR(hr);
+	return (hr == S_OK);
+}
 
 /* Wait for a logical drive to reappear - Used when a drive has just been repartitioned */
 BOOL WaitForLogical(DWORD DriveIndex, uint64_t PartitionOffset)
@@ -911,26 +1154,66 @@ UINT GetDriveTypeFromIndex(DWORD DriveIndex)
 	return drive_type;
 }
 
+// Removes all drive letters associated with the specific drive, and return
+// either the first or last letter that was removed, according to bReturnLast.
+char RemoveDriveLetters(DWORD DriveIndex, BOOL bReturnLast, BOOL bSilent)
+{
+	int i, len;
+	char drive_letters[27] = { 0 }, drive_name[4] = "#:\\";
+
+	if (!GetDriveLetters(DriveIndex, drive_letters)) {
+		suprintf("Failed to get a drive letter");
+		return 0;
+	}
+	if (drive_letters[0] == 0) {
+		suprintf("No drive letter was assigned...");
+		return GetUnusedDriveLetter();
+	}
+	len = (int)strlen(drive_letters);
+	if (len == 0)
+		return 0;
+
+	// Unmount all mounted volumes that belong to this drive
+	for (i = 0; i < len; i++) {
+		// Check that the current image isn't located on a drive we are trying to dismount
+		if ((boot_type == BT_IMAGE) && (drive_letters[i] == (PathGetDriveNumberU(image_path) + 'A'))) {
+			if ((PathGetDriveNumberU(image_path) + 'A') == drive_letters[i]) {
+				suprintf("ABORTED: Cannot use an image that is located on the target drive!");
+				return 0;
+			}
+		}
+		drive_name[0] = drive_letters[i];
+		// DefineDosDevice() cannot have a trailing backslash...
+		drive_name[2] = 0;
+		DefineDosDeviceA(DDD_REMOVE_DEFINITION, drive_name, NULL);
+		// ... but DeleteVolumeMountPoint() requires one. Go figure...
+		drive_name[2] = '\\';
+		if (!DeleteVolumeMountPointA(drive_name))
+			suprintf("Failed to delete mountpoint %s: %s", drive_name, WindowsErrorString());
+	}
+	return drive_letters[bReturnLast ? (len - 1) : 0];
+}
+
 /*
- * Return the next unused drive letter from the system
+ * Return the next unused drive letter from the system or NUL on error.
  */
 char GetUnusedDriveLetter(void)
 {
 	DWORD size;
-	char drive_letter = 'Z'+1, *drive, drives[26*4 + 1];	/* "D:\", "E:\", etc., plus one NUL */
+	char drive_letter, *drive, drives[26*4 + 1];	/* "D:\", "E:\", etc., plus one NUL */
 
 	size = GetLogicalDriveStringsA(sizeof(drives), drives);
 	if (size == 0) {
 		uprintf("GetLogicalDriveStrings failed: %s", WindowsErrorString());
-		goto out;
+		return 0;
 	}
 	if (size > sizeof(drives)) {
 		uprintf("GetLogicalDriveStrings: Buffer too small (required %d vs. %d)", size, sizeof(drives));
-		goto out;
+		return 0;
 	}
 
 	for (drive_letter = 'C'; drive_letter <= 'Z'; drive_letter++) {
-		for (drive = drives ;*drive; drive += safe_strlen(drive)+1) {
+		for (drive = drives ; *drive; drive += safe_strlen(drive) + 1) {
 			if (!isalpha(*drive))
 				continue;
 			if (drive_letter == (char)toupper((int)*drive))
@@ -940,8 +1223,30 @@ char GetUnusedDriveLetter(void)
 			break;
 	}
 
-out:
-	return (drive_letter>'Z')?0:drive_letter;
+	return (drive_letter > 'Z') ? 0 : drive_letter;
+}
+
+BOOL IsDriveLetterInUse(const char drive_letter)
+{
+	DWORD size;
+	char *drive, drives[26 * 4 + 1];
+
+	size = GetLogicalDriveStringsA(sizeof(drives), drives);
+	if (size == 0) {
+		uprintf("GetLogicalDriveStrings failed: %s", WindowsErrorString());
+		return TRUE;
+	}
+	if (size > sizeof(drives)) {
+		uprintf("GetLogicalDriveStrings: Buffer too small (required %d vs. %d)", size, sizeof(drives));
+		return TRUE;
+	}
+
+	for (drive = drives; *drive; drive += safe_strlen(drive) + 1) {
+		if (drive_letter == (char)toupper((int)*drive))
+			return TRUE;
+	}
+
+	return FALSE;
 }
 
 /*
@@ -969,6 +1274,7 @@ BOOL GetDriveLabel(DWORD DriveIndex, char* letters, char** label)
 			wchar_to_utf8_no_alloc(VolumeName, VolumeLabel, sizeof(VolumeLabel));
 			*label = (VolumeLabel[0] != 0) ? VolumeLabel : STR_NO_LABEL;
 		}
+		safe_closehandle(h);
 		// Drive without volume assigned - always enabled
 		return TRUE;
 	}
@@ -1000,7 +1306,8 @@ BOOL GetDriveLabel(DWORD DriveIndex, char* letters, char** label)
 		*label = (char*)GetExtFsLabel(DriveIndex, 0);
 		if (*label == NULL) {
 			SetLastError(error);
-			duprintf("Failed to read label: %s", WindowsErrorString());
+			if (error != ERROR_UNRECOGNIZED_VOLUME)
+				duprintf("Failed to read label: %s", WindowsErrorString());
 			*label = STR_NO_LABEL;
 		}
 	}
@@ -1066,7 +1373,6 @@ const struct {int (*fn)(FILE *fp); char* str;} known_mbr[] = {
 // Returns TRUE if the drive seems bootable, FALSE otherwise
 BOOL AnalyzeMBR(HANDLE hPhysicalDrive, const char* TargetName, BOOL bSilent)
 {
-	const char* mbr_name = "Master Boot Record";
 	FAKE_FD fake_fd = { 0 };
 	FILE* fp = (FILE*)&fake_fd;
 	int i;
@@ -1075,17 +1381,17 @@ BOOL AnalyzeMBR(HANDLE hPhysicalDrive, const char* TargetName, BOOL bSilent)
 	set_bytes_per_sector(SelectedDrive.SectorSize);
 
 	if (!is_br(fp)) {
-		suprintf("%s does not have an x86 %s", TargetName, mbr_name);
+		suprintf("%s does not have a Boot Marker", TargetName);
 		return FALSE;
 	}
 	for (i=0; i<ARRAYSIZE(known_mbr); i++) {
 		if (known_mbr[i].fn(fp)) {
-			suprintf("%s has a %s %s", TargetName, known_mbr[i].str, mbr_name);
+			suprintf("%s has a %s Master Boot Record", TargetName, known_mbr[i].str);
 			return TRUE;
 		}
 	}
 
-	suprintf("%s has an unknown %s", TargetName, mbr_name);
+	suprintf("%s has an unknown Master Boot Record", TargetName);
 	return TRUE;
 }
 
@@ -1129,6 +1435,157 @@ BOOL AnalyzePBR(HANDLE hLogicalVolume)
 	return TRUE;
 }
 
+static BOOL StoreEspInfo(GUID* guid)
+{
+	uint8_t j;
+	char key_name[2][16], *str;
+	// Look for an empty slot and use that if available
+	for (j = 1; j <= MAX_ESP_TOGGLE; j++) {
+		static_sprintf(key_name[0], "ToggleEsp%02u", j);
+		str = ReadSettingStr(key_name[0]);
+		if ((str == NULL) || (str[0] == 0))
+			return WriteSettingStr(key_name[0], GuidToString(guid));
+	}
+	// All slots are used => Move every key down and add to last slot
+	// NB: No, we don't care that the slot we remove may not be the oldest.
+	for (j = 1; j < MAX_ESP_TOGGLE; j++) {
+		static_sprintf(key_name[0], "ToggleEsp%02u", j);
+		static_sprintf(key_name[1], "ToggleEsp%02u", j + 1);
+		WriteSettingStr(key_name[0], ReadSettingStr(key_name[1]));
+	}
+	return WriteSettingStr(key_name[1], GuidToString(guid));
+}
+
+static GUID* GetEspGuid(uint8_t index)
+{
+	char key_name[16];
+
+	static_sprintf(key_name, "ToggleEsp%02u", index);
+	return StringToGuid(ReadSettingStr(key_name));
+}
+
+static BOOL ClearEspInfo(uint8_t index)
+{
+	char key_name[16];
+	static_sprintf(key_name, "ToggleEsp%02u", index);
+	return WriteSettingStr(key_name, "");
+}
+
+/*
+ * This calls changes the type of a GPT ESP back and forth to Basic Data.
+ * Needed because Windows 10 doesn't mount ESPs by default, and also
+ * doesn't let usermode apps (such as File Explorer) access mounted ESPs.
+ */
+BOOL ToggleEsp(DWORD DriveIndex, uint64_t PartitionOffset)
+{
+	char *volume_name, mount_point[] = DEFAULT_ESP_MOUNT_POINT;
+	BOOL r, ret = FALSE, found = FALSE;
+	HANDLE hPhysical;
+	DWORD size, i, j, esp_index = 0;
+	BYTE layout[4096] = { 0 };
+	GUID* guid;
+	PDRIVE_LAYOUT_INFORMATION_EX DriveLayout = (PDRIVE_LAYOUT_INFORMATION_EX)(void*)layout;
+
+	if ((PartitionOffset == 0) && (nWindowsVersion < WINDOWS_10)) {
+		uprintf("ESP toggling is only available for Windows 10 or later");
+		return FALSE;
+	}
+
+	hPhysical = GetPhysicalHandle(DriveIndex, FALSE, TRUE, TRUE);
+	if (hPhysical == INVALID_HANDLE_VALUE)
+		return FALSE;
+
+	r = DeviceIoControl(hPhysical, IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
+		NULL, 0, layout, sizeof(layout), &size, NULL);
+	if (!r || size <= 0) {
+		uprintf("Could not get layout for drive 0x%02x: %s", DriveIndex, WindowsErrorString());
+		goto out;
+	}
+	// TODO: Handle MBR
+	if (DriveLayout->PartitionStyle != PARTITION_STYLE_GPT) {
+		uprintf("ESP toggling is only available for GPT drives");
+		goto out;
+	}
+
+	if (PartitionOffset == 0) {
+		// See if the current drive contains an ESP
+		for (i = 0, j = 0; i < DriveLayout->PartitionCount; i++) {
+			if (CompareGUID(&DriveLayout->PartitionEntry[i].Gpt.PartitionType, &PARTITION_GENERIC_ESP)) {
+				esp_index = i;
+				j++;
+			}
+		}
+
+		if (j > 1) {
+			uprintf("ESP toggling is not available for drives with more than one ESP");
+			goto out;
+		}
+		if (j == 1) {
+			// ESP -> Basic Data
+			i = esp_index;
+			uprintf("ESP name: '%S'", DriveLayout->PartitionEntry[i].Gpt.Name);
+			if (!StoreEspInfo(&DriveLayout->PartitionEntry[i].Gpt.PartitionId)) {
+				uprintf("ESP toggling data could not be stored");
+				goto out;
+			}
+			DriveLayout->PartitionEntry[i].Gpt.PartitionType = PARTITION_MICROSOFT_DATA;
+		} else {
+			// Basic Data -> ESP
+			for (j = 1; j <= MAX_ESP_TOGGLE; j++) {
+				guid = GetEspGuid((uint8_t)j);
+				if (guid != NULL) {
+					for (i = 0; i < DriveLayout->PartitionCount; i++) {
+						if (CompareGUID(guid, &DriveLayout->PartitionEntry[i].Gpt.PartitionId)) {
+							found = TRUE;
+							break;
+						}
+					}
+					if (found)
+						break;
+				}
+			}
+			if (j > MAX_ESP_TOGGLE)
+				goto out;
+			DriveLayout->PartitionEntry[i].Gpt.PartitionType = PARTITION_GENERIC_ESP;
+		}
+	} else {
+		for (i = 0, j = 0; i < DriveLayout->PartitionCount; i++) {
+			if (DriveLayout->PartitionEntry[i].StartingOffset.QuadPart == PartitionOffset) {
+				DriveLayout->PartitionEntry[i].Gpt.PartitionType = PARTITION_GENERIC_ESP;
+				break;
+			}
+		}
+	}
+	if (i >= DriveLayout->PartitionCount) {
+		uprintf("No partition to toggle");
+		goto out;
+	}
+
+	DriveLayout->PartitionEntry[i].RewritePartition = TRUE;	// Just in case
+	r = DeviceIoControl(hPhysical, IOCTL_DISK_SET_DRIVE_LAYOUT_EX, (BYTE*)DriveLayout, size, NULL, 0, &size, NULL);
+	if (!r) {
+		uprintf("Could not set drive layout: %s", WindowsErrorString());
+		goto out;
+	}
+	RefreshDriveLayout(hPhysical);
+	if (PartitionOffset == 0) {
+		if (CompareGUID(&DriveLayout->PartitionEntry[i].Gpt.PartitionType, &PARTITION_GENERIC_ESP)) {
+			// We successfully reverted ESP from Basic Data -> Delete stored ESP info
+			ClearEspInfo((uint8_t)j);
+		} else if (!IsDriveLetterInUse(*mount_point)) {
+			// We succesfully switched ESP to Basic Data -> Try to mount it
+			volume_name = GetLogicalName(DriveIndex, DriveLayout->PartitionEntry[i].StartingOffset.QuadPart, TRUE, FALSE);
+			IGNORE_RETVAL(MountVolume(mount_point, volume_name));
+			free(volume_name);
+		}
+	}
+	ret = TRUE;
+
+out:
+	safe_closehandle(hPhysical);
+	return ret;
+}
+
 /*
  * Fill the drive properties (size, FS, etc)
  * Returns TRUE if the drive has a partition that can be mounted in Windows, FALSE otherwise
@@ -1161,14 +1618,14 @@ BOOL GetDrivePartitionData(DWORD DriveIndex, char* FileSystemName, DWORD FileSys
 
 	hPhysical = GetPhysicalHandle(DriveIndex, FALSE, FALSE, TRUE);
 	if (hPhysical == INVALID_HANDLE_VALUE)
-		return 0;
+		return FALSE;
 
 	r = DeviceIoControl(hPhysical, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
 			NULL, 0, geometry, sizeof(geometry), &size, NULL);
 	if (!r || size <= 0) {
 		suprintf("Could not get geometry for drive 0x%02x: %s", DriveIndex, WindowsErrorString());
 		safe_closehandle(hPhysical);
-		return 0;
+		return FALSE;
 	}
 	SelectedDrive.DiskSize = DiskGeometry->DiskSize.QuadPart;
 	SelectedDrive.SectorSize = DiskGeometry->Geometry.BytesPerSector;
@@ -1191,13 +1648,9 @@ BOOL GetDrivePartitionData(DWORD DriveIndex, char* FileSystemName, DWORD FileSys
 	if (!r || size <= 0) {
 		suprintf("Could not get layout for drive 0x%02x: %s", DriveIndex, WindowsErrorString());
 		safe_closehandle(hPhysical);
-		return 0;
+		return FALSE;
 	}
 
-#if defined(__GNUC__)
-// GCC 4.9 bugs us about the fact that MS defined an expandable array as array[1]
-#pragma GCC diagnostic ignored "-Warray-bounds"
-#endif
 	switch (DriveLayout->PartitionStyle) {
 	case PARTITION_STYLE_MBR:
 		SelectedDrive.PartitionStyle = PARTITION_STYLE_MBR;
@@ -1281,8 +1734,10 @@ BOOL GetDrivePartitionData(DWORD DriveIndex, char* FileSystemName, DWORD FileSys
 			}
 			SelectedDrive.nPartitions++;
 			isUefiNtfs = (wcscmp(DriveLayout->PartitionEntry[i].Gpt.Name, L"UEFI:NTFS") == 0);
-			suprintf("Partition %d%s:\r\n  Type: %s\r\n  Name: '%S'", i+1, isUefiNtfs ? " (UEFI:NTFS)" : "",
-				GetGPTPartitionType(&DriveLayout->PartitionEntry[i].Gpt.PartitionType), DriveLayout->PartitionEntry[i].Gpt.Name);
+			suprintf("Partition %d%s:\r\n  Type: %s", i+1, isUefiNtfs ? " (UEFI:NTFS)" : "",
+				GetGPTPartitionType(&DriveLayout->PartitionEntry[i].Gpt.PartitionType));
+			if (DriveLayout->PartitionEntry[i].Gpt.Name[0] != 0)
+				suprintf("  Name: '%S'", DriveLayout->PartitionEntry[i].Gpt.Name);
 			suprintf("  ID: %s\r\n  Size: %s (%" PRIi64 " bytes)\r\n  Start Sector: %" PRIi64 ", Attributes: 0x%016" PRIX64,
 				GuidToString(&DriveLayout->PartitionEntry[i].Gpt.PartitionId),
 				SizeToHumanReadable(DriveLayout->PartitionEntry[i].PartitionLength.QuadPart, TRUE, FALSE),
@@ -1359,14 +1814,39 @@ BOOL UnmountVolume(HANDLE hDrive)
  */
 BOOL MountVolume(char* drive_name, char *volume_name)
 {
-	char mounted_guid[52];
+	char mounted_guid[52], dos_name[] = "?:";
+#if defined(WINDOWS_IS_NOT_BUGGY)
 	char mounted_letter[27] = { 0 };
 	DWORD size;
+#endif
 
-	if ((drive_name == NULL) || (volume_name == NULL) || (drive_name[0] == '?') ||
-		(strncmp(volume_name, groot_name, groot_len) == 0))
+	if ((drive_name == NULL) || (volume_name == NULL) || (drive_name[0] == '?')) {
+		SetLastError(ERROR_INVALID_PARAMETER);
 		return FALSE;
+	}
 
+	// If we are working with a "\\?\GLOBALROOT" device, SetVolumeMountPoint()
+	// is useless, so try with DefineDosDevice() instead.
+	if (_strnicmp(volume_name, groot_name, groot_len) == 0) {
+		dos_name[0] = drive_name[0];
+		// Microsoft will also have to explain why "In no case is a trailing backslash allowed" [1] in
+		// DefineDosDevice(), instead of just checking if the driver parameter is "X:\" and remove the
+		// backslash from a copy of the parameter in the bloody API call. *THIS* really tells a lot
+		// about the level of thought and foresight that actually goes into the Windows APIs...
+		// [1] https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-definedosdevicew
+		if (!DefineDosDeviceA(DDD_RAW_TARGET_PATH | DDD_NO_BROADCAST_SYSTEM, dos_name, &volume_name[14])) {
+			uprintf("Could not mount %s as %C:", volume_name, drive_name[0]);
+			return FALSE;
+		}
+		uprintf("%s was successfully mounted as %C:", volume_name, drive_name[0]);
+		return TRUE;
+	}
+
+	// Great: Windows has a *MAJOR BUG* whereas, in some circumstances, GetVolumePathNamesForVolumeName()
+	// can return the *WRONG* drive letter. And yes, we validated that this is *NOT* an issue like stack
+	// or buffer corruption and whatnot. It *IS* a Windows bug. So just drop the idea of updating the
+	// drive letter if already mounted and use the passed target always.
+#if defined(WINDOWS_IS_NOT_BUGGY)
 	// Windows may already have the volume mounted but under a different letter.
 	// If that is the case, update drive_name to that letter.
 	if ( (GetVolumePathNamesForVolumeNameA(volume_name, mounted_letter, sizeof(mounted_letter), &size))
@@ -1376,6 +1856,7 @@ BOOL MountVolume(char* drive_name, char *volume_name)
 		drive_name[0] = mounted_letter[0];
 		return TRUE;
 	}
+#endif
 
 	if (!SetVolumeMountPointA(drive_name, volume_name)) {
 		if (GetLastError() == ERROR_DIR_NOT_EMPTY) {
@@ -1386,12 +1867,12 @@ BOOL MountVolume(char* drive_name, char *volume_name)
 				uprintf("%s is mounted, but volume GUID doesn't match:\r\n  expected %s, got %s",
 					drive_name, volume_name, mounted_guid);
 			} else {
-				uprintf("%s is already mounted as %C:", volume_name, drive_name[0]);
+				duprintf("%s is already mounted as %C:", volume_name, drive_name[0]);
 				return TRUE;
 			}
 			uprintf("Retrying after dismount...");
 			if (!DeleteVolumeMountPointA(drive_name))
-				uprintf("Warning: Could not delete volume mountpoint: %s", WindowsErrorString());
+				uprintf("Warning: Could not delete volume mountpoint '%s': %s", drive_name, WindowsErrorString());
 			if (SetVolumeMountPointA(drive_name, volume_name))
 				return TRUE;
 			if ((GetLastError() == ERROR_DIR_NOT_EMPTY) &&
@@ -1424,7 +1905,7 @@ char* AltMountVolume(DWORD DriveIndex, uint64_t PartitionOffset, BOOL bSilent)
 		goto out;
 	}
 	// Can't use a regular volume GUID for ESPs...
-	volume_name = AltGetLogicalName(DriveIndex, PartitionOffset, FALSE, TRUE);
+	volume_name = AltGetLogicalName(DriveIndex, PartitionOffset, FALSE, FALSE);
 	if ((volume_name == NULL) || (strncmp(volume_name, groot_name, groot_len) != 0)) {
 		suprintf("Unexpected volume name: '%s'", volume_name);
 		goto out;
@@ -1462,26 +1943,20 @@ BOOL AltUnmountVolume(const char* drive_name, BOOL bSilent)
  * Issue a complete remount of the volume.
  * Note that drive_name *may* be altered when the volume gets remounted.
  */
-BOOL RemountVolume(char* drive_name)
+BOOL RemountVolume(char* drive_name, BOOL bSilent)
 {
 	char volume_name[51];
 
 	// UDF requires a sync/flush, and it's also a good idea for other FS's
 	FlushDrive(drive_name[0]);
 	if (GetVolumeNameForVolumeMountPointA(drive_name, volume_name, sizeof(volume_name))) {
-		if (DeleteVolumeMountPointA(drive_name)) {
-			Sleep(200);
-			if (MountVolume(drive_name, volume_name)) {
-				uprintf("Successfully remounted %s as %C:", volume_name, drive_name[0]);
-			} else {
-				uprintf("Failed to remount %s as %C:", volume_name, drive_name[0]);
-				// This will leave the drive inaccessible and must be flagged as an error
-				FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|APPERR(ERROR_CANT_REMOUNT_VOLUME);
-				return FALSE;
-			}
+		if (MountVolume(drive_name, volume_name)) {
+			suprintf("Successfully remounted %s as %C:", volume_name, drive_name[0]);
 		} else {
-			uprintf("Could not remount %s as %C: %s", volume_name, drive_name[0], WindowsErrorString());
-			// Try to continue regardless
+			suprintf("Could not remount %s as %C: %s", volume_name, drive_name[0], WindowsErrorString());
+			// This will leave the drive inaccessible and must be flagged as an error
+			FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|APPERR(ERROR_CANT_REMOUNT_VOLUME);
+			return FALSE;
 		}
 	}
 	return TRUE;
@@ -1492,7 +1967,6 @@ BOOL RemountVolume(char* drive_name)
  * properly reset Windows's cached view of a drive partitioning short of cycling the USB port
  * (especially IOCTL_DISK_UPDATE_PROPERTIES is *USELESS*), and therefore the OS will try to
  * read the file system data at an old location, even if the partition has just been deleted.
- * TODO: We should do something like this in DeletePartitions() too.
  */
 static BOOL ClearPartition(HANDLE hDrive, LARGE_INTEGER offset, DWORD size)
 {
@@ -1522,7 +1996,8 @@ static BOOL ClearPartition(HANDLE hDrive, LARGE_INTEGER offset, DWORD size)
 BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL mbr_uefi_marker, uint8_t extra_partitions)
 {
 	const char* PartitionTypeName[] = { "MBR", "GPT", "SFD" };
-	const wchar_t *extra_part_name = L"", *main_part_name = L"Main Data Partition";
+	const wchar_t *extra_part_name = L"", *main_part_name = write_as_esp ? L"EFI System Partition" : L"Main Data Partition";
+	const LONGLONG main_part_size = write_as_esp ? MAX_ISO_TO_ESP_SIZE * MB : SelectedDrive.DiskSize;
 	const LONGLONG bytes_per_track = ((LONGLONG)SelectedDrive.SectorsPerTrack) * SelectedDrive.SectorSize;
 	const DWORD size_to_clear = MAX_SECTORS_TO_CLEAR * SelectedDrive.SectorSize;
 	uint8_t* buffer;
@@ -1531,7 +2006,11 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 	DRIVE_LAYOUT_INFORMATION_EX4 DriveLayoutEx = {0};
 	BOOL r;
 	DWORD i, size, bufsize, pn = 0;
-	LONGLONG main_part_size_in_sectors, extra_part_size_in_tracks = 0, ms_esp_size;
+	LONGLONG main_part_size_in_sectors, extra_part_size_in_tracks = 0;
+	// Go for a 260 MB sized ESP by default to keep everyone happy, including 4K sector users:
+	// https://docs.microsoft.com/en-us/windows-hardware/manufacture/desktop/configure-uefigpt-based-hard-drive-partitions
+	// and folks using MacOS: https://github.com/pbatard/rufus/issues/979
+	LONGLONG esp_size = 260 * MB;
 
 	PrintInfoDebug(0, MSG_238, PartitionTypeName[partition_style]);
 
@@ -1553,8 +2032,45 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 		// Go with the MS 1 MB wastage at the beginning...
 		DriveLayoutEx.PartitionEntry[pn].StartingOffset.QuadPart = MB;
 	} else {
-		// Align on Cylinder
-		DriveLayoutEx.PartitionEntry[pn].StartingOffset.QuadPart = bytes_per_track;
+		// Some folks appear to think that 'Fixes for old BIOSes' is some kind of magic
+		// wand and are adamant to try to apply them when creating *MODERN* VHD drives.
+		// This, however, wrecks havok on MS' internal format calls because, as opposed
+		// to what is the case for regular drives, VHDs require each cluster block to
+		// be aligned to the cluster size, and that may not be the case with the stupid
+		// CHS sizes that IBM imparted upon us. Long story short, we now align to a
+		// cylinder size that is itself aligned to the cluster size.
+		// If this actually breaks old systems, please send your complaints to IBM.
+		LONGLONG ClusterSize = (LONGLONG)ComboBox_GetCurItemData(hClusterSize);
+		if (ClusterSize == 0)
+			ClusterSize = 0x200;
+		DriveLayoutEx.PartitionEntry[pn].StartingOffset.QuadPart =
+			((bytes_per_track + (ClusterSize - 1)) / ClusterSize) * ClusterSize;
+	}
+
+	// Having the ESP up front may help (and is the Microsoft recommended way) but this
+	// is only achievable if we can mount more than one partition at once, which means
+	// either fixed drive or Windows 10 1703 or later.
+	if (((SelectedDrive.MediaType == FixedMedia) || (nWindowsBuildNumber > 15000)) &&
+		(extra_partitions & XP_ESP)) {
+		assert(partition_style == PARTITION_STYLE_GPT);
+		extra_part_name = L"EFI System Partition";
+		DriveLayoutEx.PartitionEntry[pn].PartitionLength.QuadPart = esp_size;
+		DriveLayoutEx.PartitionEntry[pn].Gpt.PartitionType = PARTITION_GENERIC_ESP;
+		uprintf("● Creating %S (offset: %lld, size: %s)", extra_part_name, DriveLayoutEx.PartitionEntry[pn].StartingOffset.QuadPart,
+			SizeToHumanReadable(DriveLayoutEx.PartitionEntry[pn].PartitionLength.QuadPart, TRUE, FALSE));
+		IGNORE_RETVAL(CoCreateGuid(&DriveLayoutEx.PartitionEntry[pn].Gpt.PartitionId));
+		wcsncpy(DriveLayoutEx.PartitionEntry[pn].Gpt.Name, extra_part_name, ARRAYSIZE(DriveLayoutEx.PartitionEntry[pn].Gpt.Name));
+		// Zero the first sectors from this partition to avoid file system caching issues
+		if (!ClearPartition(hDrive, DriveLayoutEx.PartitionEntry[pn].StartingOffset, size_to_clear))
+			uprintf("Could not zero %S: %s", extra_part_name, WindowsErrorString());
+		SelectedDrive.PartitionOffset[pn] = DriveLayoutEx.PartitionEntry[pn].StartingOffset.QuadPart;
+		SelectedDrive.PartitionSize[pn] = DriveLayoutEx.PartitionEntry[pn].PartitionLength.QuadPart;
+		partition_offset[PI_ESP] = SelectedDrive.PartitionOffset[pn];
+		pn++;
+		DriveLayoutEx.PartitionEntry[pn].StartingOffset.QuadPart = DriveLayoutEx.PartitionEntry[pn - 1].StartingOffset.QuadPart +
+			DriveLayoutEx.PartitionEntry[pn - 1].PartitionLength.QuadPart;
+		// Clear the extra partition we processed
+		extra_partitions &= ~(XP_ESP);
 	}
 
 	// If required, set the MSR partition (GPT only - must be created before the data part)
@@ -1580,23 +2096,21 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 	}
 
 	// Set our main data partition
-	main_part_size_in_sectors = (SelectedDrive.DiskSize - DriveLayoutEx.PartitionEntry[pn].StartingOffset.QuadPart) /
-		// Need 33 sectors at the end for secondary GPT
-		SelectedDrive.SectorSize - ((partition_style == PARTITION_STYLE_GPT)?33:0);
+	if (write_as_esp) {
+		// Align ESP to 64 MB while leaving at least 32 MB free space
+		esp_size = max(esp_size, ((((LONGLONG)img_report.projected_size / MB) + 96) / 64) * 64 * MB);
+		main_part_size_in_sectors = (esp_size - DriveLayoutEx.PartitionEntry[pn].StartingOffset.QuadPart) /
+			SelectedDrive.SectorSize;
+	} else {
+		main_part_size_in_sectors = (main_part_size - DriveLayoutEx.PartitionEntry[pn].StartingOffset.QuadPart) /
+			// Need 33 sectors at the end for secondary GPT
+			SelectedDrive.SectorSize - ((partition_style == PARTITION_STYLE_GPT) ? 33 : 0);
+	}
 	if (extra_partitions) {
 		// Adjust the size according to extra partitions (which we always align to a track)
 		if (extra_partitions & XP_ESP) {
 			extra_part_name = L"EFI System";
-			// The size of the ESP depends on the minimum size we're able to format in FAT32, which
-			// in turn depends on the cluster size used, which in turn depends on the disk sector size.
-			// Plus some people are complaining that the *OFFICIAL MINIMUM SIZE* as documented by Microsoft at
-			// https://docs.microsoft.com/en-us/windows-hardware/manufacture/desktop/configure-uefigpt-based-hard-drive-partitions
-			// is too small. See: https://github.com/pbatard/rufus/issues/979
-			if (SelectedDrive.SectorSize <= 4096)
-				ms_esp_size = 300 * MB;
-			else
-				ms_esp_size = 1200 * MB;	// That'll teach you to have a nonstandard disk!
-			extra_part_size_in_tracks = (ms_esp_size + bytes_per_track - 1) / bytes_per_track;
+			extra_part_size_in_tracks = (esp_size + bytes_per_track - 1) / bytes_per_track;
 		} else if (extra_partitions & XP_UEFI_NTFS) {
 			extra_part_name = L"UEFI:NTFS";
 			extra_part_size_in_tracks = (max(MIN_EXTRA_PART_SIZE, uefi_ntfs_size) + bytes_per_track - 1) / bytes_per_track;
@@ -1610,6 +2124,8 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 		} else {
 			assert(FALSE);
 		}
+		// NB: Because we already subtracted the backup GPT size from the main partition size and
+		// this extra partition is indexed on main size, it does not overflow into the backup GPT.
 		main_part_size_in_sectors = ((main_part_size_in_sectors / SelectedDrive.SectorsPerTrack) -
 			extra_part_size_in_tracks) * SelectedDrive.SectorsPerTrack;
 	}
@@ -1649,7 +2165,7 @@ BOOL CreatePartition(HANDLE hDrive, int partition_style, int file_system, BOOL m
 			return FALSE;
 		}
 	} else {
-		DriveLayoutEx.PartitionEntry[pn].Gpt.PartitionType = PARTITION_MICROSOFT_DATA;
+		DriveLayoutEx.PartitionEntry[pn].Gpt.PartitionType = write_as_esp ? PARTITION_GENERIC_ESP : PARTITION_MICROSOFT_DATA;
 		IGNORE_RETVAL(CoCreateGuid(&DriveLayoutEx.PartitionEntry[pn].Gpt.PartitionId));
 		wcsncpy(DriveLayoutEx.PartitionEntry[pn].Gpt.Name, main_part_name, ARRAYSIZE(DriveLayoutEx.PartitionEntry[pn].Gpt.Name));
 	}
@@ -1799,7 +2315,7 @@ BOOL InitializeDisk(HANDLE hDrive)
 	DWORD size;
 	CREATE_DISK CreateDisk = {PARTITION_STYLE_RAW, {{0}}};
 
-	PrintInfoDebug(0, MSG_239);
+	uprintf("Initializing disk...");
 
 	size = sizeof(CreateDisk);
 	r = DeviceIoControl(hDrive, IOCTL_DISK_CREATE_DISK,

@@ -1,7 +1,7 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * Formatting function calls
- * Copyright © 2011-2020 Pete Batard <pete@akeo.ie>
+ * Copyright © 2011-2021 Pete Batard <pete@akeo.ie>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -66,7 +66,7 @@ extern uint32_t dur_mins, dur_secs;
 extern uint32_t wim_nb_files, wim_proc_files, wim_extra_files;
 static int actual_fs_type, wintogo_index = -1, wininst_index = 0;
 extern BOOL force_large_fat32, enable_ntfs_compression, lock_drive, zero_drive, fast_zeroing, enable_file_indexing, write_as_image;
-extern BOOL use_vds;
+extern BOOL use_vds, write_as_esp;
 uint8_t *grub2_buf = NULL, *sec_buf = NULL;
 long grub2_len;
 
@@ -181,8 +181,12 @@ static BOOLEAN __stdcall FormatExCallback(FILE_SYSTEM_CALLBACK_COMMAND Command, 
 		uprintf("No media in drive");
 		FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|ERROR_NO_MEDIA_IN_DRIVE;
 		break;
+	case FCC_ALIGNMENT_VIOLATION:
+		uprintf("Partition start offset is not aligned to the cluster size");
+		FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|ERROR_OFFSET_ALIGNMENT_VIOLATION;
+		break;
 	default:
-		uprintf("FormatExCallback: Received unhandled command 0x02%X - aborting", Command);
+		uprintf("FormatExCallback: Received unhandled command 0x%02X - aborting", Command);
 		FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|ERROR_NOT_SUPPORTED;
 		break;
 	}
@@ -342,13 +346,13 @@ static BOOL FormatNativeVds(DWORD DriveIndex, uint64_t PartitionOffset, DWORD Cl
 	VolumeName = GetLogicalName(DriveIndex, PartitionOffset, TRUE, TRUE);
 	wVolumeName = utf8_to_wchar(VolumeName);
 	if (wVolumeName == NULL) {
-		uprintf("Could not read volume name");
+		uprintf("Could not read volume name (%s)", VolumeName);
 		FormatStatus = ERROR_SEVERITY_ERROR | FAC(FACILITY_STORAGE) | ERROR_GEN_FAILURE;
 		goto out;
 	}
 
 	// Initialize COM
-	IGNORE_RETVAL(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED));
+	IGNORE_RETVAL(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
 	IGNORE_RETVAL(CoInitializeSecurity(NULL, -1, NULL, NULL, RPC_C_AUTHN_LEVEL_CONNECT,
 		RPC_C_IMP_LEVEL_IMPERSONATE, NULL, 0, NULL));
 
@@ -560,6 +564,7 @@ out:
 	safe_free(wVolumeName);
 	safe_free(wLabel);
 	safe_free(wFSName);
+	CoUninitialize();
 	return r;
 }
 
@@ -583,7 +588,7 @@ static BOOL FormatNative(DWORD DriveIndex, uint64_t PartitionOffset, DWORD Clust
 	VolumeName = GetLogicalName(DriveIndex, PartitionOffset, TRUE, TRUE);
 	wVolumeName = utf8_to_wchar(VolumeName);
 	if (wVolumeName == NULL) {
-		uprintf("Could not read volume name");
+		uprintf("Could not read volume name (%s)", VolumeName);
 		FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|ERROR_GEN_FAILURE;
 		goto out;
 	}
@@ -701,7 +706,7 @@ out:
 static BOOL ClearMBRGPT(HANDLE hPhysicalDrive, LONGLONG DiskSize, DWORD SectorSize, BOOL add1MB)
 {
 	BOOL r = FALSE;
-	uint64_t i, j, last_sector = DiskSize/SectorSize, num_sectors_to_clear;
+	uint64_t i, last_sector = DiskSize/SectorSize, num_sectors_to_clear;
 	unsigned char* pBuf = (unsigned char*) calloc(SectorSize, 1);
 
 	PrintInfoDebug(0, MSG_224);
@@ -725,32 +730,16 @@ static BOOL ClearMBRGPT(HANDLE hPhysicalDrive, LONGLONG DiskSize, DWORD SectorSi
 
 	uprintf("Erasing %d sectors", num_sectors_to_clear);
 	for (i = 0; i < num_sectors_to_clear; i++) {
-		for (j = 1; j <= WRITE_RETRIES; j++) {
-			CHECK_FOR_USER_CANCEL;
-			if (write_sectors(hPhysicalDrive, SectorSize, i, 1, pBuf) == SectorSize)
-				break;
-			if (j >= WRITE_RETRIES)
-				goto out;
-			uprintf("Retrying in %d seconds...", WRITE_TIMEOUT / 1000);
-			// Don't sit idly but use the downtime to check for conflicting processes...
-			Sleep(CheckDriveAccess(WRITE_TIMEOUT, FALSE));
-		}
+		CHECK_FOR_USER_CANCEL;
+		if (write_sectors(hPhysicalDrive, SectorSize, i, 1, pBuf) != SectorSize)
+			goto out;
 	}
 	for (i = last_sector - MAX_SECTORS_TO_CLEAR; i < last_sector; i++) {
-		for (j = 1; j <= WRITE_RETRIES; j++) {
-			CHECK_FOR_USER_CANCEL;
-			if (write_sectors(hPhysicalDrive, SectorSize, i, 1, pBuf) == SectorSize)
-				break;
-			if (j >= WRITE_RETRIES) {
-				// Windows seems to be an ass about keeping a lock on a backup GPT,
-				// so we try to be lenient about not being able to clear it.
-				uprintf("Warning: Failed to clear backup GPT...");
-				r = TRUE;
-				goto out;
-			}
-			uprintf("Retrying in %d seconds...", WRITE_TIMEOUT / 1000);
-			Sleep(CheckDriveAccess(WRITE_TIMEOUT, FALSE));
-		}
+		CHECK_FOR_USER_CANCEL;
+		// Windows seems to be an ass about keeping a lock on a backup GPT,
+		// so we try to be lenient about not being able to clear it.
+		if (write_sectors(hPhysicalDrive, SectorSize, i, 1, pBuf) != SectorSize)
+			break;
 	}
 	r = TRUE;
 
@@ -798,7 +787,7 @@ static BOOL WriteMBR(HANDLE hPhysicalDrive)
 		goto out;
 	}
 
-	switch (ComboBox_GetItemData(hFileSystem, ComboBox_GetCurSel(hFileSystem))) {
+	switch (ComboBox_GetCurItemData(hFileSystem)) {
 	case FS_FAT16:
 		if (buffer[0x1c2] == 0x0e) {
 			uprintf("Partition is already FAT16 LBA...\n");
@@ -819,7 +808,7 @@ static BOOL WriteMBR(HANDLE hPhysicalDrive)
 	if ((boot_type != BT_NON_BOOTABLE) && (target_type == TT_BIOS)) {
 		// Set first partition bootable - masquerade as per the DiskID selected
 		buffer[0x1be] = IsChecked(IDC_RUFUS_MBR) ?
-			(BYTE)ComboBox_GetItemData(hDiskID, ComboBox_GetCurSel(hDiskID)):0x80;
+			(BYTE)ComboBox_GetCurItemData(hDiskID):0x80;
 		uprintf("Set bootable USB partition as 0x%02X\n", buffer[0x1be]);
 	}
 
@@ -920,9 +909,11 @@ static BOOL WriteSBR(HANDLE hPhysicalDrive)
 			sub_type = BT_GRUB4DOS;
 		if (img_report.has_grub2)
 			sub_type = BT_GRUB2;
-	} else if (partition_type == PARTITION_STYLE_GPT) {
-		sub_type = BT_NON_BOOTABLE;
 	}
+
+	// Use BT_MAX for the protective message
+	if ((boot_type != BT_NON_BOOTABLE) && (partition_type == PARTITION_STYLE_GPT))
+		sub_type = BT_MAX;
 
 	switch (sub_type) {
 	case BT_GRUB4DOS:
@@ -950,7 +941,7 @@ static BOOL WriteSBR(HANDLE hPhysicalDrive)
 			}
 		}
 		break;
-	case BT_NON_BOOTABLE:
+	case BT_MAX:
 		uprintf("Writing protective message SBR");
 		size = 4 * KB;
 		br_size = 17 * KB;	// 34 sectors are reserved for protective MBR + primary GPT
@@ -970,12 +961,14 @@ static BOOL WriteSBR(HANDLE hPhysicalDrive)
 		(DWORD)(SelectedDrive.SectorsPerTrack * SelectedDrive.SectorSize) : 1 * MB;
 	if (br_size + size > max_size) {
 		uprintf("  SBR size is too large - You may need to uncheck 'Add fixes for old BIOSes'.");
+		if (sub_type == BT_MAX)
+			safe_free(buf);
 		return FALSE;
 	}
 
 	r = write_data(fp, br_size, buf, (uint64_t)size);
 	safe_free(grub2_buf);
-	if (sub_type == BT_NON_BOOTABLE)
+	if (sub_type == BT_MAX)
 		safe_free(buf);
 	return (r != 0);
 }
@@ -1212,8 +1205,8 @@ out:
 // Returns -2 on user cancel, -1 on other error, >=0 on success.
 int SetWinToGoIndex(void)
 {
-	char *mounted_iso, *build, image[128];
-	char tmp_path[MAX_PATH] = "", xml_file[MAX_PATH] = "";
+	char *mounted_iso, *build, mounted_image_path[128];
+	char xml_file[MAX_PATH] = "";
 	char *install_names[MAX_WININST];
 	StrArray version_name, version_index;
 	int i, build_nr = 0;
@@ -1222,8 +1215,8 @@ int SetWinToGoIndex(void)
 	// Sanity checks
 	wintogo_index = -1;
 	wininst_index = 0;
-	if ((nWindowsVersion < WINDOWS_8) || ((WimExtractCheck() & 4) == 0) ||
-		(ComboBox_GetItemData(hFileSystem, ComboBox_GetCurSel(hFileSystem)) != FS_NTFS)) {
+	if ((nWindowsVersion < WINDOWS_8) || ((WimExtractCheck(FALSE) & 4) == 0) ||
+		(ComboBox_GetCurItemData(hFileSystem) != FS_NTFS)) {
 		return -1;
 	}
 
@@ -1239,18 +1232,18 @@ int SetWinToGoIndex(void)
 			wininst_index = 0;
 	}
 
-	// Mount the install.wim image, that resides on the ISO
-	mounted_iso = MountISO(image_path);
-	if (mounted_iso == NULL) {
-		uprintf("Could not mount ISO for Windows To Go selection");
-		return FALSE;
+	// If we're not using a straigth install.wim, we need to mount the ISO to access it
+	if (!img_report.is_windows_img) {
+		mounted_iso = MountISO(image_path);
+		if (mounted_iso == NULL) {
+			uprintf("Could not mount ISO for Windows To Go selection");
+			return FALSE;
+		}
+		static_sprintf(mounted_image_path, "%s%s", mounted_iso, &img_report.wininst_path[wininst_index][2]);
 	}
-	static_sprintf(image, "%s%s", mounted_iso, &img_report.wininst_path[wininst_index][2]);
 
 	// Now take a look at the XML file in install.wim to list our versions
-	if ((GetTempPathU(sizeof(tmp_path), tmp_path) == 0)
-		|| (GetTempFileNameU(tmp_path, APPLICATION_NAME, 0, xml_file) == 0)
-		|| (xml_file[0] == 0)) {
+	if ((GetTempFileNameU(temp_dir, APPLICATION_NAME, 0, xml_file) == 0) || (xml_file[0] == 0)) {
 		// Last ditch effort to get a tmp file - just extract it to the current directory
 		static_strcpy(xml_file, ".\\RufVXml.tmp");
 	}
@@ -1258,7 +1251,8 @@ int SetWinToGoIndex(void)
 	DeleteFileU(xml_file);
 
 	// Must use the Windows WIM API as 7z messes up the XML
-	if (!WimExtractFile_API(image, 0, "[1].xml", xml_file)) {
+	if (!WimExtractFile_API(img_report.is_windows_img ? image_path : mounted_image_path,
+		0, "[1].xml", xml_file, FALSE)) {
 		uprintf("Could not acquire WIM index");
 		goto out;
 	}
@@ -1320,25 +1314,19 @@ int SetWinToGoIndex(void)
 
 out:
 	DeleteFileU(xml_file);
-	UnMountISO();
+	if (!img_report.is_windows_img)
+		UnMountISO();
 	return wintogo_index;
 }
 
 // http://technet.microsoft.com/en-ie/library/jj721578.aspx
-// As opposed to the technet guide above, we no longer set internal drives offline,
-// due to people wondering why they can't see them by default.
-//#define SET_INTERNAL_DRIVES_OFFLINE
+// As opposed to the technet guide above, we don't set internal drives offline,
+// due to people wondering why they can't see them by default and we also use
+// bcdedit rather than 'unattend.xml' to disable the recovery environment.
 static BOOL SetupWinToGo(DWORD DriveIndex, const char* drive_name, BOOL use_esp)
 {
-#ifdef SET_INTERNAL_DRIVES_OFFLINE
-	static char san_policy_path[] = "?:\\san_policy.xml";
-#endif
-	static char unattend_path[] = "?:\\Windows\\System32\\sysprep\\unattend.xml";
-	char *mounted_iso, *ms_efi = NULL, image[128], cmd[MAX_PATH];
-	unsigned char *buffer;
-	DWORD bufsize;
+	char *mounted_iso, *ms_efi = NULL, mounted_image_path[128], cmd[MAX_PATH];
 	ULONG cluster_size;
-	FILE* fd;
 
 	uprintf("Windows To Go mode selected");
 	// Additional sanity checks
@@ -1347,25 +1335,28 @@ static BOOL SetupWinToGo(DWORD DriveIndex, const char* drive_name, BOOL use_esp)
 		return FALSE;
 	}
 
-	// First, we need to access the install.wim image, that resides on the ISO
-	mounted_iso = MountISO(image_path);
-	if (mounted_iso == NULL) {
-		uprintf("Could not mount ISO for Windows To Go installation");
-		FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|APPERR(ERROR_ISO_EXTRACT);
-		return FALSE;
+	if (!img_report.is_windows_img) {
+		mounted_iso = MountISO(image_path);
+		if (mounted_iso == NULL) {
+			uprintf("Could not mount ISO for Windows To Go installation");
+			FormatStatus = ERROR_SEVERITY_ERROR | FAC(FACILITY_STORAGE) | APPERR(ERROR_ISO_EXTRACT);
+			return FALSE;
+		}
+		static_sprintf(mounted_image_path, "%s%s", mounted_iso, &img_report.wininst_path[wininst_index][2]);
+		uprintf("Mounted ISO as '%s'", mounted_iso);
 	}
-	static_sprintf(image, "%s%s", mounted_iso, &img_report.wininst_path[wininst_index][2]);
-	uprintf("Mounted ISO as '%s'", mounted_iso);
 
 	// Now we use the WIM API to apply that image
-	if (!WimApplyImage(image, wintogo_index, drive_name)) {
+	if (!WimApplyImage(img_report.is_windows_img ? image_path : mounted_image_path, wintogo_index, drive_name)) {
 		uprintf("Failed to apply Windows To Go image");
 		if (!IS_ERROR(FormatStatus))
 			FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|APPERR(ERROR_ISO_EXTRACT);
-		UnMountISO();
+		if (!img_report.is_windows_img)
+			UnMountISO();
 		return FALSE;
 	}
-	UnMountISO();
+	if (!img_report.is_windows_img)
+		UnMountISO();
 
 	if (use_esp) {
 		uprintf("Setting up EFI System Partition");
@@ -1389,9 +1380,6 @@ static BOOL SetupWinToGo(DWORD DriveIndex, const char* drive_name, BOOL use_esp)
 			return FALSE;
 		}
 		Sleep(200);
-	}
-
-	if (use_esp) {
 		// Need to have the ESP mounted to invoke bcdboot
 		ms_efi = AltMountVolume(DriveIndex, partition_offset[PI_ESP], FALSE);
 		if (ms_efi == NULL) {
@@ -1401,66 +1389,51 @@ static BOOL SetupWinToGo(DWORD DriveIndex, const char* drive_name, BOOL use_esp)
 	}
 
 	// We invoke the 'bcdboot' command from the host, as the one from the drive produces problems (#558)
+	// and of course, we couldn't invoke an ARM64 'bcdboot' binary on an x86 host anyway...
 	// Also, since Rufus should (usually) be running as a 32 bit app, on 64 bit systems, we need to use
 	// 'C:\Windows\Sysnative' and not 'C:\Windows\System32' to invoke bcdboot, as 'C:\Windows\System32'
 	// will get converted to 'C:\Windows\SysWOW64' behind the scenes, and there is no bcdboot.exe there.
+	uprintf("Enabling boot using command:");
 	static_sprintf(cmd, "%s\\bcdboot.exe %s\\Windows /v /f %s /s %s", sysnative_dir, drive_name,
 		HAS_BOOTMGR_BIOS(img_report) ? (HAS_BOOTMGR_EFI(img_report) ? "ALL" : "BIOS") : "UEFI",
 		(use_esp)?ms_efi:drive_name);
-	uprintf("Enabling boot using command '%s'", cmd);
+	uprintf(cmd);
 	if (RunCommand(cmd, sysnative_dir, usb_debug) != 0) {
 		// Try to continue... but report a failure
 		uprintf("Failed to enable boot");
 		FormatStatus = ERROR_SEVERITY_ERROR | FAC(FACILITY_STORAGE) | APPERR(ERROR_ISO_EXTRACT);
 	}
 
+	UpdateProgressWithInfo(OP_FILE_COPY, MSG_267, wim_proc_files + 2 * wim_extra_files, wim_nb_files);
+
+	uprintf("Disable the use of the Windows Recovery Environment using command:");
+	static_sprintf(cmd, "%s\\bcdedit.exe /store %s\\EFI\\Microsoft\\Boot\\BCD /set {default} recoveryenabled no",
+		sysnative_dir, (use_esp) ? ms_efi : drive_name);
+	uprintf(cmd);
+	RunCommand(cmd, sysnative_dir, usb_debug);
+
+	UpdateProgressWithInfo(OP_FILE_COPY, MSG_267, wim_nb_files, wim_nb_files);
+
 	if (use_esp) {
 		Sleep(200);
 		AltUnmountVolume(ms_efi, FALSE);
 	}
-	UpdateProgressWithInfo(OP_FILE_COPY, MSG_267, wim_proc_files + 2 * wim_extra_files, wim_nb_files);
-
-	// The following are non fatal if they fail
-
-#ifdef SET_INTERNAL_DRIVES_OFFLINE
-	uprintf("Applying 'san_policy.xml', to set the target's internal drives offline...");
-	buffer = GetResource(hMainInstance, MAKEINTRESOURCEA(IDR_TOGO_SAN_POLICY_XML),
-		_RT_RCDATA, "san_policy.xml", &bufsize, FALSE);
-	san_policy_path[0] = drive_name[0];
-	fd = fopenU(san_policy_path, "wb");
-	if ((fd == NULL) || (fwrite(buffer, 1, bufsize, fd) != bufsize)) {
-		uprintf("Could not write '%s'\n", san_policy_path);
-		if (fd)
-			fclose(fd);
-	} else {
-		fclose(fd);
-		// Can't use the one from the USB (at least for Windows 10 preview), as you'll get
-		// "Error: 0x800401f0  An error occurred while initializing COM security".
-		// On the other hand, using Windows 8.1 dism against Windows 10 doesn't work either
-		// (you get a message about needing to upgrade to latest AIK)...
-		static_sprintf(cmd, "dism /Image:%s\\ /Apply-Unattend:%s", drive_name, san_policy_path);
-		if (RunCommand(cmd, NULL, TRUE) != 0)
-			uprintf("Command '%s' failed to run", cmd);
-	}
-#endif
-
-	uprintf("Copying 'unattend.xml', to disable the use of the Windows Recovery Environment...");
-	buffer = GetResource(hMainInstance, MAKEINTRESOURCEA(IDR_TOGO_UNATTEND_XML),
-		_RT_RCDATA, "unattend.xml", &bufsize, FALSE);
-	unattend_path[0] = drive_name[0];
-	fd = fopenU(unattend_path, "wb");
-	if ((fd == NULL) || (fwrite(buffer, 1, bufsize, fd) != bufsize))
-		uprintf("Could not write '%s'", unattend_path);
-	if (fd != NULL)
-		fclose(fd);
-	UpdateProgressWithInfo(OP_FILE_COPY, MSG_267, wim_nb_files, wim_nb_files);
 
 	return TRUE;
 }
 
 static void update_progress(const uint64_t processed_bytes)
 {
+	// NB: We don't really care about resetting this value to UINT64_MAX for a new pass.
+	static uint64_t last_value = UINT64_MAX;
+	uint64_t cur_value;
+
 	UpdateProgressWithInfo(OP_FORMAT, MSG_261, processed_bytes, img_report.image_size);
+	cur_value = (processed_bytes * min(80, img_report.image_size)) / img_report.image_size;
+	if (cur_value != last_value) {
+		last_value = cur_value;
+		uprintfs("+");
+	}
 }
 
 // Some compressed images use streams that aren't multiple of the sector
@@ -1469,8 +1442,11 @@ static void update_progress(const uint64_t processed_bytes)
 static int sector_write(int fd, const void* _buf, unsigned int count)
 {
 	const uint8_t* buf = (const uint8_t*)_buf;
-	const unsigned int sec_size = (unsigned int)SelectedDrive.SectorSize;
+	unsigned int sec_size = (unsigned int)SelectedDrive.SectorSize;
 	int written, fill_size = 0;
+
+	if (sec_size == 0)
+		sec_size = 512;
 
 	// If we are on a sector boundary and count is multiple of the
 	// sector size, just issue a regular write
@@ -1512,12 +1488,18 @@ static BOOL WriteDrive(HANDLE hPhysicalDrive, HANDLE hSourceImage)
 {
 	BOOL s, ret = FALSE;
 	LARGE_INTEGER li;
-	DWORD rSize, wSize, xSize, BufSize;
+	DWORD i, rSize, wSize, xSize, BufSize;
 	uint64_t wb, target_size = hSourceImage?img_report.image_size:SelectedDrive.DiskSize;
+	uint64_t cur_value, last_value = UINT64_MAX;
 	int64_t bled_ret;
-	uint8_t *buffer = NULL;
-	uint8_t *cmp_buffer = NULL;
-	int i, *ptr, zero_data, throttle_fast_zeroing = 0;
+	uint8_t* buffer = NULL;
+	uint32_t zero_data, *cmp_buffer = NULL;
+	int throttle_fast_zeroing = 0;
+
+	if (SelectedDrive.SectorSize < 512) {
+		uprintf("Unexpected sector size (%d) - Aborting", SelectedDrive.SectorSize);
+		return FALSE;
+	}
 
 	// We poked the MBR and other stuff, so we need to rewind
 	li.QuadPart = 0;
@@ -1526,7 +1508,7 @@ static BOOL WriteDrive(HANDLE hPhysicalDrive, HANDLE hSourceImage)
 	UpdateProgressWithInfoInit(NULL, FALSE);
 
 	if (img_report.compression_type != BLED_COMPRESSION_NONE) {
-		uprintf("Writing compressed image...");
+		uprintf("Writing compressed image:");
 		sec_buf = (uint8_t*)_mm_malloc(SelectedDrive.SectorSize, SelectedDrive.SectorSize);
 		if (sec_buf == NULL) {
 			FormatStatus = ERROR_SEVERITY_ERROR | FAC(FACILITY_STORAGE) | ERROR_NOT_ENOUGH_MEMORY;
@@ -1535,7 +1517,7 @@ static BOOL WriteDrive(HANDLE hPhysicalDrive, HANDLE hSourceImage)
 		}
 		assert((uintptr_t)sec_buf % SelectedDrive.SectorSize == 0);
 		sec_buf_pos = 0;
-		bled_init(_uprintf, NULL, sector_write, update_progress, &FormatStatus);
+		bled_init(_uprintf, NULL, sector_write, update_progress, NULL, &FormatStatus);
 		bled_ret = bled_uncompress_with_handles(hSourceImage, hPhysicalDrive, img_report.compression_type);
 		bled_exit();
 		if ((bled_ret >= 0) && (sec_buf_pos != 0)) {
@@ -1554,7 +1536,7 @@ static BOOL WriteDrive(HANDLE hPhysicalDrive, HANDLE hSourceImage)
 			goto out;
 		}
 	} else {
-		uprintf(hSourceImage?"Writing Image...":fast_zeroing?"Fast-zeroing drive...":"Zeroing drive...");
+		uprintf(hSourceImage?"Writing Image:":fast_zeroing?"Fast-zeroing drive:":"Zeroing drive:");
 		// Our buffer size must be a multiple of the sector size and *ALIGNED* to the sector size
 		BufSize = ((DD_BUFFER_SIZE + SelectedDrive.SectorSize - 1) / SelectedDrive.SectorSize) * SelectedDrive.SectorSize;
 		buffer = (uint8_t*)_mm_malloc(BufSize, SelectedDrive.SectorSize);
@@ -1568,20 +1550,27 @@ static BOOL WriteDrive(HANDLE hPhysicalDrive, HANDLE hSourceImage)
 		// Clear buffer
 		memset(buffer, fast_zeroing ? 0xff : 0x00, BufSize);
 
-		cmp_buffer = (uint8_t*)_mm_malloc(BufSize, SelectedDrive.SectorSize);
-		if (cmp_buffer == NULL) {
-			FormatStatus = ERROR_SEVERITY_ERROR | FAC(FACILITY_STORAGE) | ERROR_NOT_ENOUGH_MEMORY;
-			uprintf("Could not allocate disk comparison buffer");
-			goto out;
+		if (fast_zeroing) {
+			cmp_buffer = (uint32_t*)_mm_malloc(BufSize, SelectedDrive.SectorSize);
+			if (cmp_buffer == NULL) {
+				FormatStatus = ERROR_SEVERITY_ERROR | FAC(FACILITY_STORAGE) | ERROR_NOT_ENOUGH_MEMORY;
+				uprintf("Could not allocate disk comparison buffer");
+				goto out;
+			}
+			assert((uintptr_t)cmp_buffer % SelectedDrive.SectorSize == 0);
 		}
-		assert((uintptr_t)cmp_buffer % SelectedDrive.SectorSize == 0);
 
 		// Don't bother trying for something clever, using double buffering overlapped and whatnot:
 		// With Windows' default optimizations, sync read + sync write for sequential operations
 		// will be as fast, if not faster, than whatever async scheme you can come up with.
 		rSize = BufSize;
-		for (wb = 0, wSize = 0; wb < (uint64_t)SelectedDrive.DiskSize; wb += wSize) {
+		for (wb = 0, wSize = 0; wb < target_size; wb += wSize) {
 			UpdateProgressWithInfo(OP_FORMAT, hSourceImage ? MSG_261 : fast_zeroing ? MSG_306 : MSG_286, wb, target_size);
+			cur_value = (wb * min(80, target_size)) / target_size;
+			if (cur_value != last_value) {
+				last_value = cur_value;
+				uprintfs("+");
+			}
 			if (hSourceImage != NULL) {
 				s = ReadFile(hSourceImage, buffer, BufSize, &rSize, NULL);
 				if (!s) {
@@ -1614,22 +1603,17 @@ static BOOL WriteDrive(HANDLE hPhysicalDrive, HANDLE hSourceImage)
 				// Read block and compare against the block that needs to be written
 				s = ReadFile(hPhysicalDrive, cmp_buffer, rSize, &xSize, NULL);
 				if ((!s) || (xSize != rSize) ) {
-					uprintf("Read error: Could not read data for comparison - %s", WindowsErrorString());
+					uprintf("Read error: Could not read data for fast zeroing comparison - %s", WindowsErrorString());
 					goto out;
 				}
 
-				// Check for an empty block
-				ptr = (int*)(cmp_buffer);
-				// Get first element
-				zero_data = ptr[0];
+				// Check for an empty block by comparing with the first element
+				zero_data = cmp_buffer[0];
 				// Check all bits are the same
-				if ((zero_data == 0) || (zero_data == -1)) {
+				if ((zero_data == 0) || (zero_data == 0xffffffff)) {
 					// Compare the rest of the block against the first element
-					for (i = 1; i < (int)(rSize / sizeof(int)); i++) {
-						if (ptr[i] != zero_data)
-							break;
-					}
-					if (i >= (int)(rSize / sizeof(int))) {
+					for (i = 1; (i < rSize / sizeof(uint32_t)) && (cmp_buffer[i] == zero_data); i++);
+					if (i >= rSize / sizeof(uint32_t)) {
 						// Block is empty, skip write
 						wSize = rSize;
 						continue;
@@ -1694,8 +1678,9 @@ out:
  */
 DWORD WINAPI FormatThread(void* param)
 {
-	int i, r;
+	int r;
 	BOOL ret, use_large_fat32, windows_to_go, actual_lock_drive = lock_drive;
+	BOOL need_logical = FALSE;
 	DWORD cr, DriveIndex = (DWORD)(uintptr_t)param, ClusterSize, Flags;
 	HANDLE hPhysicalDrive = INVALID_HANDLE_VALUE;
 	HANDLE hLogicalVolume = INVALID_HANDLE_VALUE;
@@ -1713,7 +1698,7 @@ DWORD WINAPI FormatThread(void* param)
 
 	use_large_fat32 = (fs_type == FS_FAT32) && ((SelectedDrive.DiskSize > LARGE_FAT32_SIZE) || (force_large_fat32));
 	windows_to_go = (image_options & IMOP_WINTOGO) && (boot_type == BT_IMAGE) && HAS_WINTOGO(img_report) &&
-		(ComboBox_GetCurSel(GetDlgItem(hMainDialog, IDC_IMAGE_OPTION)) == 1);
+		ComboBox_GetCurItemData(hImageOption);
 	large_drive = (SelectedDrive.DiskSize > (1*TB));
 	if (large_drive)
 		uprintf("Notice: Large drive detected (may produce short writes)");
@@ -1731,8 +1716,8 @@ DWORD WINAPI FormatThread(void* param)
 	else if (IsChecked(IDC_OLD_BIOS_FIXES))
 		extra_partitions = XP_COMPAT;
 	// On pre 1703 platforms (and even on later ones), anything with ext2/ext3 doesn't sit
-	// too well with Windows. Relaxing our locking rules seems to help...
-	if ((extra_partitions == XP_CASPER) || (fs_type >= FS_EXT2))
+	// too well with Windows. Same with ESPs. Relaxing our locking rules seems to help...
+	if ((extra_partitions & (XP_ESP | XP_CASPER)) || (fs_type >= FS_EXT2))
 		actual_lock_drive = FALSE;
 
 	PrintInfoDebug(0, MSG_225);
@@ -1748,46 +1733,32 @@ DWORD WINAPI FormatThread(void* param)
 		FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|APPERR(ERROR_CANT_ASSIGN_LETTER);
 		goto out;
 	}
-	if (drive_letters[0] == 0) {
-		uprintf("No drive letter was assigned...");
-		drive_name[0] =  GetUnusedDriveLetter();
-		if (drive_name[0] == 0) {
-			uprintf("Could not find a suitable drive letter");
-			FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|APPERR(ERROR_CANT_ASSIGN_LETTER);
-			goto out;
-		}
-	} else {
-		// Unmount all mounted volumes that belong to this drive
-		// Do it in reverse so that we always end on the first volume letter
-		for (i = (int)safe_strlen(drive_letters); i > 0; i--) {
-			drive_name[0] = drive_letters[i-1];
-			if (boot_type == BT_IMAGE) {
-				// If we are using an image, check that it isn't located on the drive we are trying to format
-				if ((PathGetDriveNumberU(image_path) + 'A') == drive_letters[i-1]) {
-					uprintf("ABORTED: Cannot use an image that is located on the target drive!");
-					FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|ERROR_ACCESS_DENIED;
-					goto out;
-				}
-			}
-			if (!DeleteVolumeMountPointA(drive_name)) {
-				uprintf("Failed to delete mountpoint %s: %s", drive_name, WindowsErrorString());
-				// Try to continue. We will bail out if this causes an issue.
-			}
-		}
+
+	// Unassign all drives letters
+	drive_name[0] = RemoveDriveLetters(DriveIndex, TRUE, FALSE);
+	if (drive_name[0] == 0) {
+		uprintf("Unable to find a drive letter to use");
+		FormatStatus = ERROR_SEVERITY_ERROR | FAC(FACILITY_STORAGE) | APPERR(ERROR_CANT_ASSIGN_LETTER);
+		goto out;
 	}
 	uprintf("Will use '%C:' as volume mountpoint", drive_name[0]);
 
 	// It kind of blows, but we have to relinquish access to the physical drive
 	// for VDS to be able to delete the partitions that reside on it...
 	safe_unlockclose(hPhysicalDrive);
-	PrintInfoDebug(0, MSG_239);
-	if (!DeletePartitions(DriveIndex)) {
+	PrintInfo(0, MSG_239, lmprintf(MSG_307));
+	if (!DeletePartition(DriveIndex, 0, FALSE)) {
 		SetLastError(FormatStatus);
-		uprintf("Notice: Could not delete partitions: %s", WindowsErrorString());
 		FormatStatus = 0;
+		// If we couldn't delete partitions, Windows give us trouble unless we
+		// request access to the logical drive. Don't ask me why!
+		need_logical = TRUE;
 	}
 
-	// Now get RW access to the physical drive...
+	// An extra refresh of the (now empty) partition data here appears to be helpful
+	GetDrivePartitionData(SelectedDrive.DeviceNumber, fs_name, sizeof(fs_name), TRUE);
+
+	// Now get RW access to the physical drive
 	hPhysicalDrive = GetPhysicalHandle(DriveIndex, actual_lock_drive, TRUE, !actual_lock_drive);
 	if (hPhysicalDrive == INVALID_HANDLE_VALUE) {
 		FormatStatus = ERROR_SEVERITY_ERROR | FAC(FACILITY_STORAGE) | ERROR_OPEN_FAILED;
@@ -1795,17 +1766,21 @@ DWORD WINAPI FormatThread(void* param)
 	}
 	RefreshDriveLayout(hPhysicalDrive);
 
-	// ...and get a lock to the logical drive so that we can actually write something
-	hLogicalVolume = GetLogicalHandle(DriveIndex, 0, TRUE, FALSE, !actual_lock_drive);
-	if (hLogicalVolume == INVALID_HANDLE_VALUE) {
-		uprintf("Could not lock volume");
-		FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|ERROR_OPEN_FAILED;
-		goto out;
-	} else if (hLogicalVolume == NULL) {
-		// NULL is returned for cases where the drive is not yet partitioned
-		uprintf("Drive does not appear to be partitioned");
-	} else if (!UnmountVolume(hLogicalVolume)) {
-		uprintf("Trying to continue regardless...");
+	// If we write an image that contains an ESP, Windows forcibly reassigns/removes the target
+	// drive, which causes a write error. To work around this, we must lock the logical drive.
+	// Also need to lock logical drive if we couldn't delete partitions, to keep Windows happy...
+	if (((boot_type == BT_IMAGE) && write_as_image) || (need_logical)) {
+		uprintf("Requesting logical volume handle...");
+		hLogicalVolume = GetLogicalHandle(DriveIndex, 0, TRUE, FALSE, !actual_lock_drive);
+		if (hLogicalVolume == INVALID_HANDLE_VALUE) {
+			uprintf("Could not access logical volume");
+			FormatStatus = ERROR_SEVERITY_ERROR | FAC(FACILITY_STORAGE) | ERROR_OPEN_FAILED;
+			goto out;
+		// If the call succeeds (and we don't get a NULL logical handle as returned for
+		// unpartitioned drives), try to unmount the volume.
+		} else if ((hLogicalVolume == NULL) && (!UnmountVolume(hLogicalVolume))) {
+			uprintf("Trying to continue regardless...");
+		}
 	}
 	CHECK_FOR_USER_CANCEL;
 
@@ -1854,8 +1829,7 @@ DWORD WINAPI FormatThread(void* param)
 				fflush(log_fd);
 			}
 
-			if (!BadBlocks(hPhysicalDrive, SelectedDrive.DiskSize, (sel >= 2) ? 4 : sel +1,
-				(sel < 2) ? 0 : sel - 2, &report, log_fd)) {
+			if (!BadBlocks(hPhysicalDrive, SelectedDrive.DiskSize, (sel >= 2) ? 4 : sel +1, sel, &report, log_fd)) {
 				uprintf("Bad blocks: Check failed.");
 				if (!IS_ERROR(FormatStatus))
 					FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|APPERR(ERROR_BADBLOCKS_FAILURE);
@@ -1927,7 +1901,8 @@ DWORD WINAPI FormatThread(void* param)
 	UpdateProgress(OP_ZERO_MBR, -1.0f);
 	CHECK_FOR_USER_CANCEL;
 
-	if (!CreatePartition(hPhysicalDrive, partition_type, fs_type, (partition_type==PARTITION_STYLE_MBR) && (target_type==TT_UEFI), extra_partitions)) {
+	if (!CreatePartition(hPhysicalDrive, partition_type, fs_type, (partition_type == PARTITION_STYLE_MBR)
+		&& (target_type == TT_UEFI), extra_partitions)) {
 		FormatStatus = (LastWriteError != 0) ? LastWriteError : (ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|ERROR_PARTITION_FAILURE);
 		goto out;
 	}
@@ -1994,8 +1969,8 @@ DWORD WINAPI FormatThread(void* param)
 	GetWindowTextU(hLabel, label, sizeof(label));
 	if (fs_type < FS_EXT2)
 		ToValidLabel(label, (fs_type == FS_FAT16) || (fs_type == FS_FAT32) || (fs_type == FS_EXFAT));
-	ClusterSize = (DWORD)ComboBox_GetItemData(hClusterSize, ComboBox_GetCurSel(hClusterSize));
-	if (ClusterSize < 0x200)
+	ClusterSize = (DWORD)ComboBox_GetCurItemData(hClusterSize);
+	if ((ClusterSize < 0x200) || (write_as_esp))
 		ClusterSize = 0;	// 0 = default cluster size
 
 	Flags = FP_FORCE;
@@ -2043,6 +2018,9 @@ DWORD WINAPI FormatThread(void* param)
 	}
 	uprintf("Found volume %s", volume_name);
 
+	// Windows is really finicky with regards to reassigning drive letters even after
+	// we forcibly removed them, so add yet another explicit call to RemoveDriveLetters()
+	RemoveDriveLetters(DriveIndex, FALSE, TRUE);
 	if (!MountVolume(drive_name, volume_name)) {
 		uprintf("Could not remount %s as %C: %s\n", volume_name, drive_name[0], WindowsErrorString());
 		FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|APPERR(ERROR_CANT_MOUNT_VOLUME);
@@ -2111,10 +2089,10 @@ DWORD WINAPI FormatThread(void* param)
 	}
 	CHECK_FOR_USER_CANCEL;
 
-	// We issue a complete remount of the filesystem at on account of:
+	// We issue a complete remount of the filesystem on account of:
 	// - Ensuring the file explorer properly detects that the volume was updated
 	// - Ensuring that an NTFS system will be reparsed so that it becomes bootable
-	if (!RemountVolume(drive_name))
+	if (!RemountVolume(drive_name, FALSE))
 		goto out;
 	CHECK_FOR_USER_CANCEL;
 
@@ -2134,17 +2112,18 @@ DWORD WINAPI FormatThread(void* param)
 				IsFileInDB(FILES_DIR "\\grub4dos-" GRUB4DOS_VERSION "\\grldr")?"✓":"✗");
 			if (!CopyFileU(FILES_DIR "\\grub4dos-" GRUB4DOS_VERSION "\\grldr", grub4dos_dst, FALSE))
 				uprintf("Failed to copy file: %s", WindowsErrorString());
-		} else if ((boot_type == BT_IMAGE) && (image_path != NULL) && (img_report.is_iso)) {
+		} else if ((boot_type == BT_IMAGE) && (image_path != NULL) && (img_report.is_iso || img_report.is_windows_img)) {
 			UpdateProgress(OP_FILE_COPY, 0.0f);
 			drive_name[2] = 0;	// Ensure our drive is something like 'D:'
 			if (windows_to_go) {
 				PrintInfoDebug(0, MSG_268);
 				if (!SetupWinToGo(DriveIndex, drive_name, (extra_partitions & XP_ESP))) {
 					if (!IS_ERROR(FormatStatus))
-						FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|APPERR(ERROR_ISO_EXTRACT);
+						FormatStatus = ERROR_SEVERITY_ERROR | FAC(FACILITY_STORAGE) | APPERR(ERROR_ISO_EXTRACT);
 					goto out;
 				}
 			} else {
+				assert(!img_report.is_windows_img);
 				if (!ExtractISO(image_path, drive_name, FALSE)) {
 					if (!IS_ERROR(FormatStatus))
 						FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|APPERR(ERROR_ISO_EXTRACT);
@@ -2160,7 +2139,8 @@ DWORD WINAPI FormatThread(void* param)
 				}
 				// EFI mode selected, with no 'boot###.efi' but Windows 7 x64's 'bootmgr.efi' (bit #0)
 				if (((target_type == TT_UEFI) || allow_dual_uefi_bios) && HAS_WIN7_EFI(img_report)) {
-					PrintInfoDebug(0, MSG_232);
+					PrintInfo(0, MSG_232, lmprintf(MSG_307));
+					uprintf("Win7 EFI boot setup");
 					img_report.wininst_path[0][0] = drive_name[0];
 					efi_dst[0] = drive_name[0];
 					efi_dst[sizeof(efi_dst) - sizeof("\\bootx64.efi")] = 0;
@@ -2169,7 +2149,7 @@ DWORD WINAPI FormatThread(void* param)
 						FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|APPERR(ERROR_CANT_PATCH);
 					} else {
 						efi_dst[sizeof(efi_dst) - sizeof("\\bootx64.efi")] = '\\';
-						if (!WimExtractFile(img_report.wininst_path[0], 1, "Windows\\Boot\\EFI\\bootmgfw.efi", efi_dst)) {
+						if (!WimExtractFile(img_report.wininst_path[0], 1, "Windows\\Boot\\EFI\\bootmgfw.efi", efi_dst, FALSE)) {
 							uprintf("Failed to setup Win7 EFI boot");
 							FormatStatus = ERROR_SEVERITY_ERROR|FAC(FACILITY_STORAGE)|APPERR(ERROR_CANT_PATCH);
 						}
@@ -2187,7 +2167,7 @@ DWORD WINAPI FormatThread(void* param)
 		if (IsChecked(IDC_EXTENDED_LABEL))
 			SetAutorun(drive_name);
 		// Issue another complete remount before we exit, to ensure we're clean
-		RemountVolume(drive_name);
+		RemountVolume(drive_name, TRUE);
 		// NTFS fixup (WinPE/AIK images don't seem to boot without an extra checkdisk)
 		if ((boot_type == BT_IMAGE) && (img_report.is_iso) && (fs_type == FS_NTFS)) {
 			// Try to ensure that all messages from Checkdisk will be in English
@@ -2202,13 +2182,17 @@ DWORD WINAPI FormatThread(void* param)
 	}
 
 out:
+	if ((boot_type == BT_IMAGE) && write_as_image) {
+		PrintInfo(0, MSG_320, lmprintf(MSG_307));
+		VdsRescan(VDS_RESCAN_REFRESH, 0, TRUE);
+	}
 	safe_free(volume_name);
 	safe_free(buffer);
 	safe_closehandle(hSourceImage);
 	safe_unlockclose(hLogicalVolume);
 	safe_unlockclose(hPhysicalDrive);	// This can take a while
 	if (IS_ERROR(FormatStatus)) {
-		volume_name = GetLogicalName(DriveIndex, 0, TRUE, FALSE);
+		volume_name = GetLogicalName(DriveIndex, partition_offset[PI_MAIN], TRUE, TRUE);
 		if (volume_name != NULL) {
 			if (MountVolume(drive_name, volume_name))
 				uprintf("Re-mounted volume as %C: after error", drive_name[0]);

@@ -1,7 +1,7 @@
 /*
  * Rufus: The Reliable USB Formatting Utility
  * Networking functionality (web file download, check for update, etc.)
- * Copyright © 2012-2019 Pete Batard <pete@akeo.ie>
+ * Copyright © 2012-2021 Pete Batard <pete@akeo.ie>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -25,6 +25,7 @@
 
 #include <windows.h>
 #include <wininet.h>
+#include <netlistmgr.h>
 #include <stdio.h>
 #include <malloc.h>
 #include <string.h>
@@ -54,6 +55,7 @@ extern HANDLE dialog_handle;
 extern BOOL is_x86_32, close_fido_cookie_prompts;
 static DWORD error_code, fido_len = 0;
 static BOOL force_update_check = FALSE;
+static const char* request_headers = "Accept-Encoding: gzip, deflate";
 
 /*
  * FormatMessage does not handle internet errors
@@ -264,27 +266,32 @@ static HINTERNET GetInternetSession(BOOL bRetry)
 {
 	int i;
 	char agent[64];
-	BOOL r;
-	DWORD dwFlags, dwTimeout = NET_SESSION_TIMEOUT;
+	BOOL decodingSupport = TRUE;
+	DWORD dwTimeout = NET_SESSION_TIMEOUT, dwProtocolSupport = HTTP_PROTOCOL_FLAG_HTTP2;
 	HINTERNET hSession = NULL;
+	HRESULT hr = S_FALSE;
+	INetworkListManager* pNetworkListManager;
+	NLM_CONNECTIVITY Connectivity = NLM_CONNECTIVITY_DISCONNECTED;
 
-	PF_TYPE_DECL(WINAPI, BOOL, InternetGetConnectedState, (LPDWORD, DWORD));
 	PF_TYPE_DECL(WINAPI, HINTERNET, InternetOpenA, (LPCSTR, DWORD, LPCSTR, LPCSTR, DWORD));
 	PF_TYPE_DECL(WINAPI, BOOL, InternetSetOptionA, (HINTERNET, DWORD, LPVOID, DWORD));
-	PF_INIT_OR_OUT(InternetGetConnectedState, WinInet);
 	PF_INIT_OR_OUT(InternetOpenA, WinInet);
 	PF_INIT_OR_OUT(InternetSetOptionA, WinInet);
 
-	for (i = 0; i <= WRITE_RETRIES; i++) {
-		r = pfInternetGetConnectedState(&dwFlags, 0);
-		if (r || !bRetry)
-			break;
-		Sleep(1000);
+	// Create a NetworkListManager Instance to check the network connection
+	IGNORE_RETVAL(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
+	hr = CoCreateInstance(&CLSID_NetworkListManager, NULL, CLSCTX_ALL,
+		&IID_INetworkListManager, (LPVOID*)&pNetworkListManager);
+	if (hr == S_OK) {
+		for (i = 0; i <= WRITE_RETRIES; i++) {
+			hr = INetworkListManager_GetConnectivity(pNetworkListManager, &Connectivity);
+			if (hr == S_OK || !bRetry)
+				break;
+			Sleep(1000);
+		}
 	}
-	if (!r) {
-		// http://msdn.microsoft.com/en-us/library/windows/desktop/aa384702.aspx is wrong...
-		SetLastError(ERROR_INTERNET_NOT_INITIALIZED);
-		uprintf("Network is unavailable: %s", WinInetErrorString());
+	if (Connectivity == NLM_CONNECTIVITY_DISCONNECTED) {
+		SetLastError(ERROR_INTERNET_DISCONNECTED);
 		goto out;
 	}
 	static_sprintf(agent, APPLICATION_NAME "/%d.%d.%d (Windows NT %d.%d%s)",
@@ -295,8 +302,13 @@ static HINTERNET GetInternetSession(BOOL bRetry)
 	pfInternetSetOptionA(hSession, INTERNET_OPTION_CONNECT_TIMEOUT, (LPVOID)&dwTimeout, sizeof(dwTimeout));
 	pfInternetSetOptionA(hSession, INTERNET_OPTION_SEND_TIMEOUT, (LPVOID)&dwTimeout, sizeof(dwTimeout));
 	pfInternetSetOptionA(hSession, INTERNET_OPTION_RECEIVE_TIMEOUT, (LPVOID)&dwTimeout, sizeof(dwTimeout));
+	// Enable gzip and deflate decoding schemes
+	pfInternetSetOptionA(hSession, INTERNET_OPTION_HTTP_DECODING, (LPVOID)&decodingSupport, sizeof(decodingSupport));
+	// Enable HTTP/2 protocol support
+	pfInternetSetOptionA(hSession, INTERNET_OPTION_ENABLE_HTTP_PROTOCOL, (LPVOID)&dwProtocolSupport, sizeof(dwProtocolSupport));
 
 out:
+	CoUninitialize();
 	return hSession;
 }
 
@@ -384,7 +396,7 @@ uint64_t DownloadToFileOrBuffer(const char* url, const char* file, BYTE** buffer
 		goto out;
 	}
 
-	if (!pfHttpSendRequestA(hRequest, NULL, 0, NULL, 0)) {
+	if (!pfHttpSendRequestA(hRequest, request_headers, -1L, NULL, 0)) {
 		uprintf("Unable to send request: %s", WinInetErrorString());
 		goto out;
 	}
@@ -633,7 +645,7 @@ static DWORD WINAPI CheckForUpdatesThread(LPVOID param)
 
 	verbose = ReadSetting32(SETTING_VERBOSE_UPDATES);
 	// Without this the FileDialog will produce error 0x8001010E when compiled for Vista or later
-	IGNORE_RETVAL(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED));
+	IGNORE_RETVAL(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
 	// Unless the update was forced, wait a while before performing the update check
 	if (!force_update_check) {
 		// It would of course be a lot nicer to use a timer and wake the thread, but my
@@ -727,7 +739,7 @@ static DWORD WINAPI CheckForUpdatesThread(LPVOID param)
 				INTERNET_FLAG_IGNORE_REDIRECT_TO_HTTP|INTERNET_FLAG_IGNORE_REDIRECT_TO_HTTPS|
 				INTERNET_FLAG_NO_COOKIES|INTERNET_FLAG_NO_UI|INTERNET_FLAG_NO_CACHE_WRITE|INTERNET_FLAG_HYPERLINK|
 				((UrlParts.nScheme == INTERNET_SCHEME_HTTPS)?INTERNET_FLAG_SECURE:0), (DWORD_PTR)NULL);
-			if ((hRequest == NULL) || (!pfHttpSendRequestA(hRequest, NULL, 0, NULL, 0))) {
+			if ((hRequest == NULL) || (!pfHttpSendRequestA(hRequest, request_headers, -1L, NULL, 0))) {
 				uprintf("Unable to send request: %s", WinInetErrorString());
 				goto out;
 			}
@@ -840,6 +852,7 @@ out:
 	}
 	force_update_check = FALSE;
 	update_check_thread = NULL;
+	CoUninitialize();
 	ExitThread(0);
 }
 
@@ -876,7 +889,7 @@ static DWORD WINAPI DownloadISOThread(LPVOID param)
 	GUID guid;
 
 	dialog_showing++;
-	IGNORE_RETVAL(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED));
+	IGNORE_RETVAL(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE));
 
 	// Use a GUID as random unique string, else ill-intentioned security "researchers"
 	// may either spam our pipe or replace our script to fool antivirus solutions into
@@ -917,7 +930,7 @@ static DWORD WINAPI DownloadISOThread(LPVOID param)
 		free(sig);
 		uprintf("Signature is valid ✓");
 		uncompressed_size = *((uint64_t*)&compressed[5]);
-		if ((uncompressed_size < 1 * MB) && (bled_init(_uprintf, NULL, NULL, NULL, &FormatStatus) >= 0)) {
+		if ((uncompressed_size < 1 * MB) && (bled_init(_uprintf, NULL, NULL, NULL, NULL, &FormatStatus) >= 0)) {
 			fido_script = malloc((size_t)uncompressed_size);
 			size = bled_uncompress_from_buffer_to_buffer(compressed, dwCompressedSize, fido_script, (size_t)uncompressed_size, BLED_COMPRESSION_LZMA);
 			bled_exit();
@@ -980,13 +993,21 @@ static DWORD WINAPI DownloadISOThread(LPVOID param)
 	close_fido_cookie_prompts = FALSE;
 	if ((dwExitCode == 0) && PeekNamedPipe(hPipe, NULL, dwPipeSize, NULL, &dwAvail, NULL) && (dwAvail != 0)) {
 		url = malloc(dwAvail + 1);
+		dwSize = 0;
 		if ((url != NULL) && ReadFile(hPipe, url, dwAvail, &dwSize, NULL) && (dwSize > 4)) {
 #else
 	{	{	url = strdup(FORCE_URL);
 			dwSize = (DWORD)strlen(FORCE_URL);
 #endif
 			IMG_SAVE img_save = { 0 };
-			url[dwSize] = 0;
+// WTF is wrong with Microsoft's static analyzer reporting a potential buffer overflow here?!?
+#if defined(_MSC_VER)
+#pragma warning(disable: 6386)
+#endif
+			url[min(dwSize, dwAvail)] = 0;
+#if defined(_MSC_VER)
+#pragma warning(default: 6386)
+#endif
 			EXT_DECL(img_ext, GetShortName(url), __VA_GROUP__("*.iso"), __VA_GROUP__(lmprintf(MSG_036)));
 			img_save.Type = IMG_SAVE_TYPE_ISO;
 			img_save.ImagePath = FileDialog(TRUE, NULL, &img_ext, 0);
@@ -1028,6 +1049,7 @@ out:
 	free(url);
 	SendMessage(hMainDialog, UM_ENABLE_CONTROLS, 0, 0);
 	dialog_showing--;
+	CoUninitialize();
 	ExitThread(dwExitCode);
 }
 
@@ -1091,7 +1113,7 @@ BOOL IsDownloadable(const char* url)
 	if (hRequest == NULL)
 		goto out;
 
-	if (!pfHttpSendRequestA(hRequest, NULL, 0, NULL, 0))
+	if (!pfHttpSendRequestA(hRequest, request_headers, -1L, NULL, 0))
 		goto out;
 
 	// Get the file size

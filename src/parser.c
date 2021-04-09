@@ -1100,7 +1100,7 @@ char* replace_in_token_data(const char* filename, const char* token, const char*
 
 	if ((filename == NULL) || (token == NULL) || (src == NULL) || (rep == NULL))
 		return NULL;
-	if ((filename[0] == 0) || (token[0] == 0) || (src[0] == 0) || (rep[0] == 0))
+	if ((filename[0] == 0) || (token[0] == 0) || (src[0] == 0))
 		return NULL;
 	if (strcmp(src, rep) == 0)	// No need for processing is source is same as replacement
 		return NULL;
@@ -1210,9 +1210,11 @@ char* replace_in_token_data(const char* filename, const char* token, const char*
 
 		// Output all the truncated fragments + replaced strings
 		for (j = 0; torep[j] != NULL; j++)
+			// coverity[invalid_type]
 			fwprintf_s(fd_out, L"%s%s", &buf[p[j]], wrep);
 
 		// Ouput the last fragment
+		// coverity[invalid_type]
 		fwprintf_s(fd_out, L"%s", &buf[p[j]]);
 
 		ret = (char*)rep;

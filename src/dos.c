@@ -311,7 +311,7 @@ static BOOL ExtractMSDOS(const char* path)
 		goto out;
 	}
 	static_strcat(dllname, "\\diskcopy.dll");
-	hDLL = LoadLibraryA(dllname);
+	hDLL = LoadLibraryExA(dllname, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
 	if (hDLL == NULL) {
 		uprintf("Unable to open %s: %s\n", dllname, WindowsErrorString());
 		goto out;
@@ -414,7 +414,7 @@ BOOL ExtractFreeDOS(const char* path)
 
 BOOL ExtractDOS(const char* path)
 {
-	switch(ComboBox_GetItemData(hBootType, ComboBox_GetCurSel(hBootType))) {
+	switch(ComboBox_GetCurItemData(hBootType)) {
 	case BT_MSDOS:
 		return ExtractMSDOS(path);
 	case BT_FREEDOS:

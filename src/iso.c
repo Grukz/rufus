@@ -36,6 +36,7 @@
 #include <virtdisk.h>
 #include <sys/stat.h>
 
+#define DO_NOT_WANT_COMPATIBILITY
 #include <cdio/cdio.h>
 #include <cdio/logging.h>
 #include <cdio/iso9660.h>
@@ -47,6 +48,7 @@
 #include "resource.h"
 #include "msapi_utf8.h"
 #include "localization.h"
+#include "bled/bled.h"
 
 // How often should we update the progress bar (in 2K blocks) as updating
 // the progress bar for every block will bring extraction to a crawl
@@ -56,6 +58,10 @@
 // Needed for UDF symbolic link testing
 #define S_IFLNK                   0xA000
 #define S_ISLNK(m)                (((m) & S_IFMT) == S_IFLNK)
+
+// Set the iso_open_ext() extension mask according to our global options
+#define ISO_EXTENSION_MASK        (ISO_EXTENSION_ALL & (enable_joliet ? ISO_EXTENSION_ALL : ~ISO_EXTENSION_JOLIET) & \
+                                  (enable_rockridge ? ISO_EXTENSION_ALL : ~ISO_EXTENSION_ROCK_RIDGE))
 
 // Needed for UDF ISO access
 CdIo_t* cdio_open (const char* psz_source, driver_id_t driver_id) {return NULL;}
@@ -75,6 +81,7 @@ typedef struct {
 RUFUS_IMG_REPORT img_report;
 int64_t iso_blocking_status = -1;
 extern BOOL preserve_timestamps, enable_ntfs_compression;
+extern char* archive_path;
 BOOL enable_iso = TRUE, enable_joliet = TRUE, enable_rockridge = TRUE, has_ldlinux_c32;
 #define ISO_BLOCKING(x) do {x; iso_blocking_status++; } while(0)
 static const char* psz_extract_dir;
@@ -86,7 +93,9 @@ static const char* ldlinux_c32 = "ldlinux.c32";
 static const char* md5sum_name[] = { "MD5SUMS", "md5sum.txt" };
 static const char* casper_dirname = "/casper";
 static const char* efi_dirname = "/efi/boot";
-static const char* efi_bootname[] = { "bootia32.efi", "bootia64.efi", "bootx64.efi", "bootarm.efi", "bootaa64.efi", "bootebc.efi" };
+static const char* efi_bootname[MAX_ARCHS] = {
+	"bootia32.efi", "bootia64.efi", "bootx64.efi", "bootarm.efi", "bootaa64.efi",
+	"bootebc.efi", "bootriscv32.efi", "bootriscv64.efi", "bootriscv128.efi" };
 static const char* sources_str = "/sources";
 static const char* wininst_name[] = { "install.wim", "install.esd", "install.swm" };
 // We only support GRUB/BIOS (x86) that uses a standard config dir (/boot/grub/i386-pc/)
@@ -142,13 +151,7 @@ static __inline char* sanitize_filename(char* filename, BOOL* is_identical)
 
 static void log_handler (cdio_log_level_t level, const char *message)
 {
-	switch(level) {
-	case CDIO_LOG_DEBUG:
-		// TODO: use a setting to enable libcdio debug?
-		return;
-	default:
-		uprintf("libcdio: %s\n", message);
-	}
+	uprintf("libcdio: %s", message);
 }
 
 /*
@@ -252,7 +255,7 @@ static BOOL check_iso_props(const char* psz_dirname, int64_t file_length, const 
 
 		// Check for the EFI boot entries
 		if (safe_stricmp(psz_dirname, efi_dirname) == 0) {
-			for (i=0; i<ARRAYSIZE(efi_bootname); i++)
+			for (i = 0; i < ARRAYSIZE(efi_bootname); i++)
 				if (safe_stricmp(psz_basename, efi_bootname[i]) == 0)
 					img_report.has_efi |= (2 << i);	// start at 2 since "bootmgr.efi" is bit 0
 		}
@@ -322,6 +325,10 @@ static void fix_config(const char* psz_fullpath, const char* psz_path, const cha
 				// somewhere in their kernel options and use 'persistent' as keyword.
 				uprintf("  Added 'persistent' kernel option");
 				modified = TRUE;
+				// Also remove Ubuntu's "maybe-ubiquity" to avoid splash screen (GRUB only)
+				if ((props->is_grub_cfg) && replace_in_token_data(src, "linux",
+					"maybe-ubiquity", "", TRUE))
+					uprintf("  Removed 'maybe-ubiquity' kernel option");
 			} else if (replace_in_token_data(src, props->is_grub_cfg ? "linux" : "append",
 				"boot=live", "boot=live persistence", TRUE) != NULL) {
 				// Debian & derivatives are assumed to use 'boot=live' in
@@ -392,7 +399,7 @@ static void fix_config(const char* psz_fullpath, const char* psz_path, const cha
 	free(src);
 }
 
-static void print_extracted_file(char* psz_fullpath, int64_t file_length)
+static void print_extracted_file(char* psz_fullpath, uint64_t file_length)
 {
 	size_t i, nul_pos;
 
@@ -400,17 +407,25 @@ static void print_extracted_file(char* psz_fullpath, int64_t file_length)
 		return;
 	// Replace slashes with backslashes and append the size to the path for UI display
 	nul_pos = strlen(psz_fullpath);
-	for (i=0; i<nul_pos; i++)
-		if (psz_fullpath[i] == '/') psz_fullpath[i] = '\\';
+	for (i = 0; i < nul_pos; i++)
+		if (psz_fullpath[i] == '/')
+			psz_fullpath[i] = '\\';
 	safe_sprintf(&psz_fullpath[nul_pos], 24, " (%s)", SizeToHumanReadable(file_length, TRUE, FALSE));
 	uprintf("Extracting: %s\n", psz_fullpath);
 	safe_sprintf(&psz_fullpath[nul_pos], 24, " (%s)", SizeToHumanReadable(file_length, FALSE, FALSE));
 	PrintStatus(0, MSG_000, psz_fullpath);	// MSG_000 is "%s"
 	// ISO9660 cannot handle backslashes
-	for (i=0; i<nul_pos; i++)
-		if (psz_fullpath[i] == '\\') psz_fullpath[i] = '/';
+	for (i = 0; i < nul_pos; i++)
+		if (psz_fullpath[i] == '\\')
+			psz_fullpath[i] = '/';
 	// Remove the appended size for extraction
 	psz_fullpath[nul_pos] = 0;
+}
+
+static void alt_print_extracted_file(const char* psz_fullpath, uint64_t file_length)
+{
+	uprintf("Extracting: %s (%s)", psz_fullpath, SizeToHumanReadable(file_length, FALSE, FALSE));
+	PrintStatus(0, MSG_000, psz_fullpath);
 }
 
 // Convert from time_t to FILETIME
@@ -583,16 +598,16 @@ static void update_md5sum(void)
 	char md5_path[64], *md5_data = NULL, *str_pos;
 
 	if (!img_report.has_md5sum)
-		return;
+		goto out;
 
 	assert(img_report.has_md5sum <= ARRAYSIZE(md5sum_name));
 	if (img_report.has_md5sum > ARRAYSIZE(md5sum_name))
-		return;
+		goto out;
 
 	static_sprintf(md5_path, "%s\\%s", psz_extract_dir, md5sum_name[img_report.has_md5sum - 1]);
 	md5_size = read_file(md5_path, (uint8_t**)&md5_data);
 	if (md5_size == 0)
-		return;
+		goto out;
 
 	for (i = 0; i < modified_path.Index; i++) {
 		str_pos = strstr(md5_data, &modified_path.String[i][2]);
@@ -620,9 +635,12 @@ static void update_md5sum(void)
 
 	write_file(md5_path, md5_data, md5_size);
 	free(md5_data);
+
+out:
+	StrArrayDestroy(&modified_path);
 }
 
-// Returns 0 on success, nonzero on error
+// Returns 0 on success, >0 on error, <0 to ignore current dir
 static int iso_extract_files(iso9660_t* p_iso, const char *psz_path)
 {
 	HANDLE file_handle = NULL;
@@ -636,9 +654,9 @@ static int iso_extract_files(iso9660_t* p_iso, const char *psz_path)
 	CdioListNode_t* p_entnode;
 	iso9660_stat_t *p_statbuf;
 	CdioISO9660FileList_t* p_entlist;
-	size_t i, j;
+	size_t i;
 	lsn_t lsn;
-	int64_t file_length, extent_length;
+	int64_t file_length;
 
 	if ((p_iso == NULL) || (psz_path == NULL))
 		return 1;
@@ -659,6 +677,26 @@ static int iso_extract_files(iso9660_t* p_iso, const char *psz_path)
 	_CDIO_LIST_FOREACH(p_entnode, p_entlist) {
 		if (FormatStatus) goto out;
 		p_statbuf = (iso9660_stat_t*) _cdio_list_node_data(p_entnode);
+		if (scan_only && (p_statbuf->rr.b3_rock == yep) && enable_rockridge) {
+			if (p_statbuf->rr.u_su_fields & ISO_ROCK_SUF_PL) {
+				if (!img_report.has_deep_directories)
+					uprintf("  Note: The selected ISO uses Rock Ridge 'deep directories'.\r\n"
+						"  Because of this, it may take a very long time to scan or extract...");
+				img_report.has_deep_directories = TRUE;
+				// Due to the nature of the parsing of Rock Ridge deep directories
+				// which requires performing a *very costly* search of the whole
+				// ISO9660 file system to find the matching LSN, ISOs with loads of
+				// deep directory entries (e.g. OPNsense) are very slow to parse...
+				// To speed up the scan process, and since we expect deep directory
+				// entries to appear below anything we care for, we cut things
+				// short by telling the parent not to bother any further once we
+				// find that we are dealing with a deep directory.
+				r = -1;
+				// Add at least one extra block, since we're skipping content.
+				total_blocks++;
+				goto out;
+			}
+		}
 		// Eliminate . and .. entries
 		if ( (strcmp(p_statbuf->filename, ".") == 0)
 			|| (strcmp(p_statbuf->filename, "..") == 0) )
@@ -689,15 +727,18 @@ static int iso_extract_files(iso9660_t* p_iso, const char *psz_path)
 				}
 				safe_free(psz_sanpath);
 			}
-			if (iso_extract_files(p_iso, psz_iso_name))
+			r = iso_extract_files(p_iso, psz_iso_name);
+			if (r > 0)
 				goto out;
+			if (r < 0)	// Stop processing current dir
+				break;
 		} else {
-			file_length = p_statbuf->size;
+			file_length = p_statbuf->total_size;
 			if (check_iso_props(psz_path, file_length, psz_basename, psz_fullpath, &props)) {
 				continue;
 			}
 			print_extracted_file(psz_fullpath, file_length);
-			for (i=0; i<NB_OLD_C32; i++) {
+			for (i = 0; i < NB_OLD_C32; i++) {
 				if (props.is_old_c32[i] && use_own_c32[i]) {
 					static_sprintf(tmp, "%s/syslinux-%s/%s", FILES_DIR, embedded_sl_version_str[0], old_c32_name[i]);
 					if (CopyFileU(tmp, psz_fullpath, FALSE)) {
@@ -727,29 +768,24 @@ static int iso_extract_files(iso9660_t* p_iso, const char *psz_path)
 					uprintf(stupid_antivirus);
 				else
 					goto out;
-			} else {
-				for (j=0; j<p_statbuf->extents; j++) {
-					extent_length = p_statbuf->extsize[j];
-					for (i=0; extent_length>0; i++) {
-						if (FormatStatus) goto out;
-						memset(buf, 0, ISO_BLOCKSIZE);
-						lsn = p_statbuf->lsn[j] + (lsn_t)i;
-						if (iso9660_iso_seek_read(p_iso, buf, lsn, 1) != ISO_BLOCKSIZE) {
-							uprintf("  Error reading ISO9660 file %s at LSN %lu",
-								psz_iso_name, (long unsigned int)lsn);
-							goto out;
-						}
-						buf_size = (DWORD)MIN(extent_length, ISO_BLOCKSIZE);
-						ISO_BLOCKING(r = WriteFileWithRetry(file_handle, buf, buf_size, &wr_size, WRITE_RETRIES));
-						if (!r) {
-							uprintf("  Error writing file: %s", WindowsErrorString());
-							goto out;
-						}
-						extent_length -= ISO_BLOCKSIZE;
-						if (nb_blocks++ % PROGRESS_THRESHOLD == 0)
-							UpdateProgressWithInfo(OP_FILE_COPY, MSG_231, nb_blocks, total_blocks);
-					}
+			} else for (i = 0; file_length > 0; i++) {
+				if (FormatStatus) goto out;
+				memset(buf, 0, ISO_BLOCKSIZE);
+				lsn = p_statbuf->lsn + (lsn_t)i;
+				if (iso9660_iso_seek_read(p_iso, buf, lsn, 1) != ISO_BLOCKSIZE) {
+					uprintf("  Error reading ISO9660 file %s at LSN %lu",
+						psz_iso_name, (long unsigned int)lsn);
+					goto out;
 				}
+				buf_size = (DWORD)MIN(file_length, ISO_BLOCKSIZE);
+				ISO_BLOCKING(r = WriteFileWithRetry(file_handle, buf, buf_size, &wr_size, WRITE_RETRIES));
+				if (!r) {
+					uprintf("  Error writing file: %s", WindowsErrorString());
+					goto out;
+				}
+				file_length -= ISO_BLOCKSIZE;
+				if (nb_blocks++ % PROGRESS_THRESHOLD == 0)
+					UpdateProgressWithInfo(OP_FILE_COPY, MSG_231, nb_blocks, total_blocks);
 			}
 			if (preserve_timestamps) {
 				LPFILETIME ft = to_filetime(mktime(&p_statbuf->tm));
@@ -997,7 +1033,7 @@ out:
 			}
 		}
 		if (!IS_EFI_BOOTABLE(img_report) && HAS_EFI_IMG(img_report) && HasEfiImgBootLoaders()) {
-			img_report.has_efi = 0x80;
+			img_report.has_efi = 0x8000;
 		}
 		if (HAS_WINPE(img_report)) {
 			// In case we have a WinPE 1.x based iso, we extract and parse txtsetup.sif
@@ -1022,7 +1058,8 @@ out:
 		if (img_report.has_grub2) {
 			// In case we have a GRUB2 based iso, we extract boot/grub/i386-pc/normal.mod to parse its version
 			img_report.grub2_version[0] = 0;
-			if ((GetTempPathU(sizeof(path), path) != 0) && (GetTempFileNameU(path, APPLICATION_NAME, 0, path) != 0)) {
+			// coverity[swapped_arguments]
+			if (GetTempFileNameU(temp_dir, APPLICATION_NAME, 0, path) != 0) {
 				size = (size_t)ExtractISOFile(src_iso, "boot/grub/i386-pc/normal.mod", path, FILE_ATTRIBUTE_NORMAL);
 				buf = (char*)calloc(size, 1);
 				fd = fopen(path, "rb");
@@ -1048,7 +1085,7 @@ out:
 		SendMessage(hMainDialog, UM_PROGRESS_EXIT, 0, 0);
 	} else {
 		// Solus and other ISOs only provide EFI boot files in a FAT efi.img
-		if (img_report.has_efi == 0x80)
+		if (img_report.has_efi == 0x8000)
 			DumpFatDir(dest_dir, 0);
 		if (HAS_SYSLINUX(img_report)) {
 			static_sprintf(path, "%s\\syslinux.cfg", dest_dir);
@@ -1079,11 +1116,16 @@ out:
 			}
 			if (fd != NULL)
 				fclose(fd);
-			update_md5sum();
-			StrArrayDestroy(&modified_path);
 		} else if (HAS_BOOTMGR(img_report) && enable_ntfs_compression) {
 			// bootmgr might need to be uncompressed: https://github.com/pbatard/rufus/issues/1381
 			RunCommand("compact /u bootmgr* efi/boot/*.efi", dest_dir, TRUE);
+		}
+		update_md5sum();
+		if (archive_path != NULL) {
+			uprintf("● Adding files from %s", archive_path);
+			bled_init(NULL, NULL, NULL, NULL, alt_print_extracted_file, NULL);
+			bled_uncompress_to_dir(archive_path, dest_dir, BLED_COMPRESSION_ZIP);
+			bled_exit();
 		}
 	}
 	if (p_iso != NULL)
@@ -1097,9 +1139,9 @@ out:
 
 int64_t ExtractISOFile(const char* iso, const char* iso_file, const char* dest_file, DWORD attributes)
 {
-	size_t i, j;
+	size_t i;
 	ssize_t read_size;
-	int64_t file_length, extent_length, r = 0;
+	int64_t file_length, r = 0;
 	char buf[UDF_BLOCKSIZE];
 	DWORD buf_size, wr_size;
 	iso9660_t* p_iso = NULL;
@@ -1150,7 +1192,9 @@ int64_t ExtractISOFile(const char* iso, const char* iso_file, const char* dest_f
 	goto out;
 
 try_iso:
-	p_iso = iso9660_open(iso);
+	// Make sure to enable extensions, else we may not match the name of the file we are looking
+	// for since Rock Ridge may be needed to translate something like 'I386_PC' into 'i386-pc'...
+	p_iso = iso9660_open_ext(iso, ISO_EXTENSION_MASK);
 	if (p_iso == NULL) {
 		uprintf("Unable to open image '%s'", iso);
 		goto out;
@@ -1162,23 +1206,21 @@ try_iso:
 		goto out;
 	}
 
-	for (j = 0; j < p_statbuf->extents; j++) {
-		extent_length = p_statbuf->extsize[j];
-		for (i = 0; extent_length > 0; i++) {
-			memset(buf, 0, ISO_BLOCKSIZE);
-			lsn = p_statbuf->lsn[j] + (lsn_t)i;
-			if (iso9660_iso_seek_read(p_iso, buf, lsn, 1) != ISO_BLOCKSIZE) {
-				uprintf("  Error reading ISO9660 file %s at LSN %lu", iso_file, (long unsigned int)lsn);
-				goto out;
-			}
-			buf_size = (DWORD)MIN(extent_length, ISO_BLOCKSIZE);
-			if (!WriteFileWithRetry(file_handle, buf, buf_size, &wr_size, WRITE_RETRIES)) {
-				uprintf("  Error writing file %s: %s", dest_file, WindowsErrorString());
-				goto out;
-			}
-			extent_length -= ISO_BLOCKSIZE;
-			r += ISO_BLOCKSIZE;
+	file_length = p_statbuf->total_size;
+	for (i = 0; file_length > 0; i++) {
+		memset(buf, 0, ISO_BLOCKSIZE);
+		lsn = p_statbuf->lsn + (lsn_t)i;
+		if (iso9660_iso_seek_read(p_iso, buf, lsn, 1) != ISO_BLOCKSIZE) {
+			uprintf("  Error reading ISO9660 file %s at LSN %lu", iso_file, (long unsigned int)lsn);
+			goto out;
 		}
+		buf_size = (DWORD)MIN(file_length, ISO_BLOCKSIZE);
+		if (!WriteFileWithRetry(file_handle, buf, buf_size, &wr_size, WRITE_RETRIES)) {
+			uprintf("  Error writing file %s: %s", dest_file, WindowsErrorString());
+			goto out;
+		}
+		file_length -= ISO_BLOCKSIZE;
+		r += ISO_BLOCKSIZE;
 	}
 
 out:
@@ -1237,7 +1279,7 @@ uint32_t GetInstallWimVersion(const char* iso)
 	goto out;
 
 try_iso:
-	p_iso = iso9660_open(iso);
+	p_iso = iso9660_open_ext(iso, ISO_EXTENSION_MASK);
 	if (p_iso == NULL) {
 		uprintf("Could not open image '%s'", iso);
 		goto out;
@@ -1247,8 +1289,8 @@ try_iso:
 		uprintf("Could not get ISO-9660 file information for file %s", wim_path);
 		goto out;
 	}
-	if (iso9660_iso_seek_read(p_iso, buf, p_statbuf->lsn[0], 1) != ISO_BLOCKSIZE) {
-		uprintf("Error reading ISO-9660 file %s at LSN %d", wim_path, p_statbuf->lsn[0]);
+	if (iso9660_iso_seek_read(p_iso, buf, p_statbuf->lsn, 1) != ISO_BLOCKSIZE) {
+		uprintf("Error reading ISO-9660 file %s at LSN %d", wim_path, p_statbuf->lsn);
 		goto out;
 	}
 	r = wim_header[3];
@@ -1324,7 +1366,7 @@ BOOL HasEfiImgBootLoaders(void)
 	if ((image_path == NULL) || !HAS_EFI_IMG(img_report))
 		return FALSE;
 
-	p_iso = iso9660_open(image_path);
+	p_iso = iso9660_open_ext(image_path, ISO_EXTENSION_MASK);
 	if (p_iso == NULL) {
 		uprintf("Could not open image '%s' as an ISO-9660 file system", image_path);
 		goto out;
@@ -1338,7 +1380,7 @@ BOOL HasEfiImgBootLoaders(void)
 	if (p_private == NULL)
 		goto out;
 	p_private->p_iso = p_iso;
-	p_private->lsn = p_statbuf->lsn[0];	// Image should be small enough not to use multiextents
+	p_private->lsn = p_statbuf->lsn;
 	p_private->sec_start = 0;
 	// Populate our intial buffer
 	if (iso9660_iso_seek_read(p_private->p_iso, p_private->buf, p_private->lsn, ISO_NB_BLOCKS) != ISO_NB_BLOCKS * ISO_BLOCKSIZE) {
@@ -1360,17 +1402,16 @@ BOOL HasEfiImgBootLoaders(void)
 	dc = direntry.entry[26] + (direntry.entry[27] << 8);
 
 	for (i = 0; i < ARRAYSIZE(efi_bootname); i++) {
-		// Sanity check in case the EFI forum comes up with a 'bootmips64.efi' or something...
-		if (strlen(efi_bootname[i]) > 12) {
-			uprintf("Internal error: FAT 8.3");
+		// TODO: bootriscv###.efi will need LFN support but cross that bridge when/if we get there...
+		if (strlen(efi_bootname[i]) > 12)
 			continue;
-		}
 		for (j = 0, k = 0; efi_bootname[i][j] != 0; j++) {
 			if (efi_bootname[i][j] == '.') {
 				while (k < 8)
 					name[k++] = ' ';
-			} else
+			} else {
 				name[k++] = toupper(efi_bootname[i][j]);
+			}
 		}
 		c = libfat_searchdir(lf_fs, dc, name, &direntry);
 		if (c > 0) {
@@ -1416,7 +1457,7 @@ BOOL DumpFatDir(const char* path, int32_t cluster)
 		// Root dir => Perform init stuff
 		if (image_path == NULL)
 			return FALSE;
-		p_iso = iso9660_open(image_path);
+		p_iso = iso9660_open_ext(image_path, ISO_EXTENSION_MASK);
 		if (p_iso == NULL) {
 			uprintf("Could not open image '%s' as an ISO-9660 file system", image_path);
 			goto out;
@@ -1430,7 +1471,7 @@ BOOL DumpFatDir(const char* path, int32_t cluster)
 		if (p_private == NULL)
 			goto out;
 		p_private->p_iso = p_iso;
-		p_private->lsn = p_statbuf->lsn[0];	// Image should be small enough not to use multiextents
+		p_private->lsn = p_statbuf->lsn;
 		p_private->sec_start = 0;
 		// Populate our intial buffer
 		if (iso9660_iso_seek_read(p_private->p_iso, p_private->buf, p_private->lsn, ISO_NB_BLOCKS) != ISO_NB_BLOCKS * ISO_BLOCKSIZE) {
